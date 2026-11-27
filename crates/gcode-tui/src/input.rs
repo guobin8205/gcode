@@ -104,6 +104,13 @@ impl InputState {
         self.history_idx = None;
     }
 
+    /// 清空整个输入框（用于误粘贴多行内容时一键重来）。
+    pub fn clear_all(&mut self) {
+        self.buf.clear();
+        self.cursor = 0;
+        self.history_idx = None;
+    }
+
     /// 提交当前输入并记入历史（自动去重连续相同条目）。
     pub fn take_and_record(&mut self) -> String {
         let taken = std::mem::take(&mut self.buf);

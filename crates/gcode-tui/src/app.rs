@@ -547,7 +547,7 @@ pub async fn run_tui_with_runtime(
                 continue;
             }
             if let Event::Key(key) = ev
-                && key.kind == KeyEventKind::Press
+                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 for c in cancel_queue.drain(..) {
@@ -618,6 +618,9 @@ pub async fn run_tui_with_runtime(
                             "正在中断当前执行…".to_string(),
                         ));
                         state.auto_scroll = true;
+                    } else if !state.input.is_empty() {
+                        // 空闲状态下按 Esc 一键清空当前输入框（方便误粘贴大段文本时快速重来）
+                        state.input.clear_all();
                     }
                 }
                 KeyCode::Tab => {
