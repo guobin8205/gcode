@@ -52,6 +52,8 @@ struct TuiState {
     input: InputState,
     /// 当前排队或运行中的后台任务计数（`pending_tasks > 1` 表示有排队任务）。
     pending_tasks: usize,
+    /// 等待依次执行的排队指令预览（独立渲染在底部状态区，不插入 `entries` 避免劈裂正在流式输出的回复）。
+    queued_inputs: VecDeque<String>,
     /// 当前正在进行的实时活动描述与起始时间（用于渲染动态 Spinner 与耗时秒表）。
     activity: Option<(String, Instant)>,
     spinner_tick: usize,
@@ -96,6 +98,7 @@ impl TuiState {
             entries,
             input: InputState::default(),
             pending_tasks: 0,
+            queued_inputs: VecDeque::new(),
             activity: None,
             spinner_tick: 0,
             last_tick: Instant::now(),
@@ -470,6 +473,9 @@ pub async fn run_tui_with_runtime(
                 }
                 ServerNotification::EventAppended { event } => match event.kind {
                     EventKind::TurnStarted { user_input, .. } => {
+                        if state.queued_inputs.front().map(String::as_str) == Some(user_input.as_str()) {
+                            state.queued_inputs.pop_front();
+                        }
                         let already_shown = matches!(
                             state.entries.last(),
                             Some(TranscriptEntry::User(s)) if s == &user_input
@@ -510,6 +516,7 @@ pub async fn run_tui_with_runtime(
                         let _ = cancel_queue.pop_front();
                         if state.pending_tasks == 0 {
                             state.activity = None;
+                            state.queued_inputs.clear();
                         } else {
                             state.activity = Some(("开始执行下一条排队指令…".to_string(), Instant::now()));
                         }
@@ -972,10 +979,8 @@ pub async fn run_tui_with_runtime(
                             "⚡ 已打断当前执行，切入新指令…".to_string(),
                         ));
                     } else if was_running {
-                        let q_pos = state.pending_tasks;
-                        state.entries.push(TranscriptEntry::SystemInfo(format!(
-                            "⏳ 已加入队列 (#{q_pos}，当前任务完成后自动执行；如需立即打断请用 Alt+Enter 或 `!指令`)：{trimmed}"
-                        )));
+                        // 放入独立排队区显示，不往 entries 插入提示以免把正在流式输出的回复劈成两半
+                        state.queued_inputs.push_back(trimmed.clone());
                     }
 
                     match trimmed.as_str() {
@@ -1206,6 +1211,19 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+        for (idx, q) in state.queued_inputs.iter().enumerate() {
+            let one_line = q.lines().next().unwrap_or(q);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  ⏳ 排队 #{}: ", idx + 1),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    truncate_chars(one_line, 72),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+        }
     }
 
     let view_height = chunks[1].height.saturating_sub(2);
