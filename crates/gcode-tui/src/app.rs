@@ -542,7 +542,7 @@ pub async fn run_tui_with_runtime(
             }
             if let Event::Paste(pasted) = ev {
                 if state.pending_approval.is_none() {
-                    state.input.insert_str(&pasted);
+                    state.input.insert_paste(&pasted);
                 }
                 continue;
             }
@@ -720,18 +720,44 @@ pub async fn run_tui_with_runtime(
                 }
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Ok(text) = paste_from_clipboard() {
-                        state.input.insert_str(&text);
+                        state.input.insert_paste(&text);
                     }
                 }
                 KeyCode::Char(c) => {
                     let now = Instant::now();
-                    if last_char_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(12))
-                        || event::poll(Duration::ZERO).unwrap_or(false)
-                    {
+                    // Windows 右键/Ctrl+Shift+V 粘贴会产生高速连续按键队列：
+                    // 若后续队列立刻有更多按键，直接一次性收拢为整段文本并折叠成 `[Pasted text #N +M lines]` 块！
+                    if event::poll(Duration::ZERO).unwrap_or(false) {
+                        let mut burst = String::new();
+                        burst.push(c);
+                        while event::poll(Duration::from_millis(8)).unwrap_or(false) {
+                            match event::read()? {
+                                Event::Key(k)
+                                    if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                                {
+                                    match k.code {
+                                        KeyCode::Char(ch) => burst.push(ch),
+                                        KeyCode::Enter => burst.push('\n'),
+                                        KeyCode::Tab => burst.push('\t'),
+                                        _ => break,
+                                    }
+                                }
+                                Event::Paste(p) => burst.push_str(&p),
+                                _ => {}
+                            }
+                        }
                         in_paste_burst = true;
+                        last_char_at = Some(Instant::now());
+                        state.input.insert_paste(&burst);
+                    } else {
+                        if last_char_at
+                            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(12))
+                        {
+                            in_paste_burst = true;
+                        }
+                        last_char_at = Some(now);
+                        state.input.insert_char(c);
                     }
-                    last_char_at = Some(now);
-                    state.input.insert_char(c);
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     state.input.insert_char('\n');

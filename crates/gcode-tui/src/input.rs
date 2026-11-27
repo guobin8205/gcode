@@ -1,6 +1,9 @@
 use ratatui::text::Line;
 
-/// 支持 UTF-8 中文字符光标移动与输入历史翻阅的命令行输入组件。
+/// 触发折叠为 `[Pasted text #N ...]` 块的单行字符数阈值（含换行符时一律折叠）。
+const PASTE_BLOCK_CHAR_THRESHOLD: usize = 160;
+
+/// 支持 UTF-8 中文光标、多行编辑、输入历史与 Claude Code 风格粘贴块折叠的输入组件。
 #[derive(Debug, Default)]
 pub struct InputState {
     buf: String,
@@ -9,6 +12,9 @@ pub struct InputState {
     history: Vec<String>,
     history_idx: Option<usize>,
     draft: String,
+    /// 折叠的粘贴块：`(占位标签, 完整原始正文)`。
+    pasted_blocks: Vec<(String, String)>,
+    paste_seq: usize,
 }
 
 impl InputState {
@@ -34,15 +40,46 @@ impl InputState {
         self.history_idx = None;
     }
 
-    /// 一次性插入多行粘贴文本（自动将 `\r\n`/`\r` 归一化为 `\n`，不触发提交）。
+    /// 插入粘贴文本：
+    /// - 多行文本或超长单行（>= 160 字）自动折叠为 `[Pasted text #N +M lines]` 块，退格一次可整体删除；
+    /// - 短单行直接明文插入，方便粘贴文件名/变量名。
+    pub fn insert_paste(&mut self, raw: &str) {
+        let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let trimmed_end = normalized.trim_end_matches('\n');
+        if trimmed_end.is_empty() {
+            return;
+        }
+
+        let line_cnt = trimmed_end.split('\n').count();
+        let char_cnt = trimmed_end.chars().count();
+        if line_cnt > 1 || char_cnt >= PASTE_BLOCK_CHAR_THRESHOLD {
+            self.paste_seq += 1;
+            let label = if line_cnt > 1 {
+                format!("[Pasted text #{} +{} lines]", self.paste_seq, line_cnt)
+            } else {
+                format!("[Pasted text #{} +{} chars]", self.paste_seq, char_cnt)
+            };
+            self.pasted_blocks
+                .push((label.clone(), trimmed_end.to_string()));
+            self.insert_raw_str(&label);
+        } else {
+            self.insert_raw_str(trimmed_end);
+        }
+    }
+
+    /// 原样插入字符串（不做块折叠）。
     pub fn insert_str(&mut self, raw: &str) {
         let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
         if normalized.is_empty() {
             return;
         }
+        self.insert_raw_str(&normalized);
+    }
+
+    fn insert_raw_str(&mut self, text: &str) {
         let byte_idx = self.byte_index_of(self.cursor);
-        self.buf.insert_str(byte_idx, &normalized);
-        self.cursor += normalized.chars().count();
+        self.buf.insert_str(byte_idx, text);
+        self.cursor += text.chars().count();
         self.history_idx = None;
     }
 
@@ -50,25 +87,54 @@ impl InputState {
         self.buf.split('\n').count().max(1)
     }
 
+    /// 退格删除：若光标紧贴某个 `[Pasted text #...]` 块末尾，一次整体删除该块。
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        let end = self.byte_index_of(self.cursor);
+        let end_byte = self.byte_index_of(self.cursor);
+        let prefix = &self.buf[..end_byte];
+        if let Some((label_len_bytes, label_len_chars)) = self
+            .pasted_blocks
+            .iter()
+            .find(|(label, _)| prefix.ends_with(label.as_str()))
+            .map(|(label, _)| (label.len(), label.chars().count()))
+        {
+            let start_byte = end_byte - label_len_bytes;
+            self.buf.replace_range(start_byte..end_byte, "");
+            self.cursor = self.cursor.saturating_sub(label_len_chars);
+            self.history_idx = None;
+            return;
+        }
+
         let start = self.byte_index_of(self.cursor - 1);
-        self.buf.replace_range(start..end, "");
+        self.buf.replace_range(start..end_byte, "");
         self.cursor -= 1;
         self.history_idx = None;
     }
 
+    /// Delete 删除：若光标紧贴某个 `[Pasted text #...]` 块开头，一次整体删除该块。
     pub fn delete(&mut self) {
         let len = self.buf.chars().count();
         if self.cursor >= len {
             return;
         }
-        let start = self.byte_index_of(self.cursor);
+        let start_byte = self.byte_index_of(self.cursor);
+        let suffix = &self.buf[start_byte..];
+        if let Some(label_len_bytes) = self
+            .pasted_blocks
+            .iter()
+            .find(|(label, _)| suffix.starts_with(label.as_str()))
+            .map(|(label, _)| label.len())
+        {
+            self.buf
+                .replace_range(start_byte..(start_byte + label_len_bytes), "");
+            self.history_idx = None;
+            return;
+        }
+
         let end = self.byte_index_of(self.cursor + 1);
-        self.buf.replace_range(start..end, "");
+        self.buf.replace_range(start_byte..end, "");
         self.history_idx = None;
     }
 
@@ -104,28 +170,37 @@ impl InputState {
         self.history_idx = None;
     }
 
-    /// 清空整个输入框（用于误粘贴多行内容时一键重来）。
+    /// 清空整个输入框与已暂存的粘贴块。
     pub fn clear_all(&mut self) {
         self.buf.clear();
         self.cursor = 0;
         self.history_idx = None;
+        self.pasted_blocks.clear();
     }
 
-    /// 提交当前输入并记入历史（自动去重连续相同条目）。
+    /// 提交当前输入：展开所有 `[Pasted text #...]` 粘贴块为原始全文，并记入历史。
     pub fn take_and_record(&mut self) -> String {
-        let taken = std::mem::take(&mut self.buf);
+        let mut taken = std::mem::take(&mut self.buf);
+        let blocks = std::mem::take(&mut self.pasted_blocks);
         self.cursor = 0;
         self.history_idx = None;
         self.draft.clear();
 
-        let trimmed = taken.trim().to_string();
-        if !trimmed.is_empty() && self.history.last().map(String::as_str) != Some(trimmed.as_str()) {
-            self.history.push(trimmed.clone());
+        let display_trimmed = taken.trim().to_string();
+        for (label, content) in blocks {
+            taken = taken.replace(&label, &content);
         }
-        trimmed
+        let expanded = taken.trim().to_string();
+
+        if !display_trimmed.is_empty()
+            && self.history.last().map(String::as_str) != Some(expanded.as_str())
+        {
+            self.history.push(expanded.clone());
+        }
+        expanded
     }
 
-    /// 向前翻阅历史（`Ctrl+P`）。
+    /// 向前翻阅历史（`↑` / `Ctrl+P`）。
     pub fn history_prev(&mut self) {
         if self.history.is_empty() {
             return;
@@ -143,7 +218,7 @@ impl InputState {
         self.move_end();
     }
 
-    /// 向后翻阅历史（`Ctrl+N`），越过最新一条时恢复草稿。
+    /// 向后翻阅历史（`↓` / `Ctrl+N`），越过最新一条时恢复草稿。
     pub fn history_next(&mut self) {
         let Some(cur) = self.history_idx else {
             return;
@@ -186,6 +261,25 @@ mod tests {
         assert_eq!(input.text(), "line1\n第二行\nline3");
         assert_eq!(input.line_count(), 3);
         assert_eq!(input.cursor_line_and_col(), (2, 5));
+    }
+
+    #[test]
+    fn multiline_paste_collapses_into_atomic_block_and_expands_on_submit() {
+        let mut input = InputState::default();
+        input.insert_str("请修复：");
+        input.insert_paste("err line 1\nerr line 2\nerr line 3\n");
+        assert_eq!(input.text(), "请修复：[Pasted text #1 +3 lines]");
+        assert_eq!(input.line_count(), 1);
+
+        // 退格一次直接删掉整个粘贴块
+        input.backspace();
+        assert_eq!(input.text(), "请修复：");
+
+        // 再粘贴一次并提交，确认自动展开为完整原文
+        input.insert_paste("a\nb\nc");
+        assert_eq!(input.text(), "请修复：[Pasted text #2 +3 lines]");
+        let submitted = input.take_and_record();
+        assert_eq!(submitted, "请修复：a\nb\nc");
     }
 
     #[test]
