@@ -816,7 +816,7 @@ pub async fn run_tui_with_runtime(
                 KeyCode::Enter => {
                     // Windows 下终端右键/Ctrl+Shift+V 粘贴会以爆发式 Key 事件涌入队列：
                     // 若 8ms 内紧跟后续按键，或刚处于高速粘贴流中，则把 Enter 当作换行而非提交。
-                    let is_paste_newline = !key.modifiers.contains(KeyModifiers::ALT)
+                    let is_paste_newline = !key.modifiers.contains(KeyModifiers::CONTROL)
                         && (event::poll(Duration::from_millis(8)).unwrap_or(false)
                             || (in_paste_burst
                                 && last_char_at
@@ -856,7 +856,7 @@ pub async fn run_tui_with_runtime(
                                 "  /thinking        切换思考过程展开/折叠（等同 Tab）",
                                 "  /clear           清空当前屏幕显示（不影响会话历史）",
                                 "  /quit            退出 gcode",
-                                "运行中发指令：Enter=加入队列等待完成 | Alt+Enter 或 `!指令`=立即打断切入 | Esc=中断",
+                                "运行中发指令：Enter=加入队列等待完成 | Ctrl+Enter 或 `!指令`=立即打断切入 | Esc=中断",
                                 "快捷键：滚轮/PgUp/PgDn 滚动 | ↑/↓ 历史 | Shift+左键复制(或 F2) | Shift+Tab 权限模式",
                             ] {
                                 state.entries.push(TranscriptEntry::SystemInfo(l.to_string()));
@@ -954,7 +954,7 @@ pub async fn run_tui_with_runtime(
                         _ => {}
                     }
 
-                    // 判断运行中是「立即打断」(Alt+Enter 或以 `!` 开头) 还是「默认排队」(直接 Enter)
+                    // 判断运行中是「立即打断」(Ctrl+Enter 或以 `!` 开头) 还是「默认排队」(直接 Enter)
                     let (interrupt_now, trimmed) = if let Some(rest) = raw_input.strip_prefix('!') {
                         let cleaned = rest.trim().to_string();
                         if cleaned.is_empty() {
@@ -962,7 +962,7 @@ pub async fn run_tui_with_runtime(
                         }
                         (true, cleaned)
                     } else {
-                        (key.modifiers.contains(KeyModifiers::ALT), raw_input)
+                        (key.modifiers.contains(KeyModifiers::CONTROL), raw_input)
                     };
 
                     let was_running = state.is_running();
@@ -1287,7 +1287,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         frame.render_widget(panel, chunks[2]);
     } else {
         let input_title = if state.is_running() {
-            " 运行中 (Enter 排队 | Alt+Enter 或 `!指令` 立即打断 | Shift+Enter 换行 | Esc 中断) "
+            " 运行中 (Enter 排队 | Ctrl+Enter 或 `!指令` 立即打断 | Shift+Enter 换行 | Esc 中断) "
         } else {
             " 输入指令 (Enter 发送 | Shift+Enter 换行 | 支持多行粘贴 | ↑/↓ 历史 | /help) "
         };
