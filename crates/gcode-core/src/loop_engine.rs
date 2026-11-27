@@ -44,7 +44,7 @@ pub struct AgentRuntime {
     pub profile: ModelProfile,
     pub tools: ToolRegistry,
     pub store: EventStore,
-    pub policy: PermissionPolicy,
+    pub policy: Arc<PermissionPolicy>,
     pub hooks: HookRunner,
     pub approval: Arc<dyn ApprovalHandler>,
     pub system_prompt: String,
@@ -67,7 +67,7 @@ impl AgentRuntime {
     ) -> Self {
         let workspace_root = workspace_root.into();
         let hooks = HookRunner::load_from_workspace(&workspace_root);
-        let policy = PermissionPolicy::load_for_workspace(&workspace_root);
+        let policy = Arc::new(PermissionPolicy::load_for_workspace(&workspace_root));
         Self {
             workspace_root,
             provider,

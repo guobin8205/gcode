@@ -196,7 +196,6 @@ enum WorkerTask {
         target_turn_id: u64,
     },
     ListTurns,
-    SetMode(PermissionMode),
 }
 
 /// 启动完整的 Ratatui 交互式终端界面，并与 `AgentRuntime` 异步联动。
@@ -208,7 +207,8 @@ pub async fn run_tui_with_runtime(
 ) -> Result<()> {
     let model_id = runtime.profile.model_id.clone();
     let workspace = runtime.workspace_root.display().to_string();
-    let initial_mode = runtime.policy.mode();
+    let policy = runtime.policy.clone();
+    let initial_mode = policy.mode();
     let mut state = TuiState::from_store(&runtime.store, model_id, workspace, initial_mode);
 
     let (task_tx, mut task_rx) = mpsc::unbounded_channel::<WorkerTask>();
@@ -355,9 +355,6 @@ pub async fn run_tui_with_runtime(
                         },
                     });
                 }
-                WorkerTask::SetMode(mode) => {
-                    runtime.policy.set_mode(mode);
-                }
             }
         }
     });
@@ -491,6 +488,21 @@ pub async fn run_tui_with_runtime(
                         }
                         state.pending_approval = None;
                     }
+                    KeyCode::BackTab => {
+                        let next = state.permission_mode.cycle();
+                        state.permission_mode = next;
+                        policy.set_mode(next);
+                        state.entries.push(TranscriptEntry::SystemInfo(format!(
+                            "已实时切换权限模式 → {}",
+                            next.label()
+                        )));
+                        if next == PermissionMode::Yolo {
+                            if let Some(broker) = &approval_broker {
+                                broker.resolve(&approval.call_id, ApprovalOutcome::AllowOnce);
+                            }
+                            state.pending_approval = None;
+                        }
+                    }
                     KeyCode::Up => {
                         state.auto_scroll = false;
                         state.scroll_offset = state.scroll_offset.saturating_sub(2);
@@ -526,9 +538,9 @@ pub async fn run_tui_with_runtime(
                 KeyCode::BackTab => {
                     let next = state.permission_mode.cycle();
                     state.permission_mode = next;
-                    let _ = task_tx.send(WorkerTask::SetMode(next));
+                    policy.set_mode(next);
                     state.entries.push(TranscriptEntry::SystemInfo(format!(
-                        "已切换权限模式 → {}（auto=编辑免问 / yolo=全自动 / ask=严格询问）",
+                        "已实时切换权限模式 → {}（auto=编辑免问 / yolo=全自动 / ask=严格询问）",
                         next.label()
                     )));
                     state.auto_scroll = true;
@@ -642,9 +654,9 @@ pub async fn run_tui_with_runtime(
                         }
                         "/yolo" => {
                             state.permission_mode = PermissionMode::Yolo;
-                            let _ = task_tx.send(WorkerTask::SetMode(PermissionMode::Yolo));
+                            policy.set_mode(PermissionMode::Yolo);
                             state.entries.push(TranscriptEntry::SystemInfo(
-                                "已切换权限模式 → yolo（所有工具自动放行，按 Shift+Tab 可切回）".to_string(),
+                                "已实时切换权限模式 → yolo（所有工具自动放行，按 Shift+Tab 可切回）".to_string(),
                             ));
                             state.auto_scroll = true;
                             continue;
@@ -653,9 +665,9 @@ pub async fn run_tui_with_runtime(
                             let arg = cmd.split_whitespace().nth(1).unwrap_or("");
                             if let Some(m) = PermissionMode::parse(arg) {
                                 state.permission_mode = m;
-                                let _ = task_tx.send(WorkerTask::SetMode(m));
+                                policy.set_mode(m);
                                 state.entries.push(TranscriptEntry::SystemInfo(format!(
-                                    "已切换权限模式 → {}",
+                                    "已实时切换权限模式 → {}",
                                     m.label()
                                 )));
                             } else {
