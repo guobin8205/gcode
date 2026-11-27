@@ -307,7 +307,7 @@ impl AgentRuntime {
                 let (output, is_error) = if cancel.is_cancelled() {
                     ("工具执行已被用户打断".to_string(), true)
                 } else {
-                    self.dispatch_tool(&call, &cancel).await
+                    self.dispatch_tool(&call, &cancel, tx).await
                 };
                 let ev = self.store.append(
                     turn_id,
@@ -342,6 +342,7 @@ impl AgentRuntime {
         &self,
         call: &gcode_protocol::ToolCall,
         cancel: &CancellationToken,
+        tx: &mpsc::UnboundedSender<ServerNotification>,
     ) -> (String, bool) {
         match self.policy.evaluate(&call.name) {
             PermissionDecision::Deny => {
@@ -383,6 +384,12 @@ impl AgentRuntime {
             workspace_root: self.workspace_root.clone(),
             call_id: call.id.clone(),
         };
+
+        let _ = tx.send(ServerNotification::ToolStarted {
+            call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            action: summarize_tool_action(&call.name, &call.arguments),
+        });
 
         let (mut content, is_error) = tokio::select! {
             _ = cancel.cancelled() => ("工具执行已被用户取消".to_string(), true),
@@ -737,6 +744,25 @@ fn format_approval_summary(workspace_root: &Path, tool_name: &str, args: &serde_
 
 fn parse_anchor_line(anchor: &str) -> Option<usize> {
     anchor.split(':').next()?.trim().parse::<usize>().ok()
+}
+
+/// 提取简洁的单行工具动作描述，用于 UI 实时状态指示器。
+fn summarize_tool_action(tool_name: &str, args: &serde_json::Value) -> String {
+    let raw = match tool_name {
+        "shell" => args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+        "read_file" | "edit_file" | "write_file" => {
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("")
+        }
+        "grep" | "glob" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
+        "spawn_agent" => args.get("task").and_then(|v| v.as_str()).unwrap_or(""),
+        _ => "",
+    };
+    let one_line = raw.lines().next().unwrap_or(raw).trim();
+    let mut s: String = one_line.chars().take(64).collect();
+    if one_line.chars().count() > 64 {
+        s.push('…');
+    }
+    s
 }
 
 /// 生成字节级稳定的基础系统提示词，并按需附加工作区 `GCODE.md` / `AGENTS.md` 规则。

@@ -28,6 +28,12 @@ pub enum ServerNotification {
         tool_name: String,
         summary: String,
     },
+    /// 工具开始执行时的实时通知，用于在 UI 中展示动态运行状态与耗时。
+    ToolStarted {
+        call_id: String,
+        tool_name: String,
+        action: String,
+    },
     /// 瞬时状态提示（如限流自动重试倒计时），仅用于前端展示，不持久化到事件日志。
     StatusMessage {
         message: String,

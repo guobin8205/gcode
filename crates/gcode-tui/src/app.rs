@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -50,8 +50,12 @@ struct TuiState {
     workspace: String,
     entries: Vec<TranscriptEntry>,
     input: InputState,
-    /// 当前排队或运行中的后台任务计数（支持运行中直接发新指令打断并无缝排队接续）。
+    /// 当前排队或运行中的后台任务计数（`pending_tasks > 1` 表示有排队任务）。
     pending_tasks: usize,
+    /// 当前正在进行的实时活动描述与起始时间（用于渲染动态 Spinner 与耗时秒表）。
+    activity: Option<(String, Instant)>,
+    spinner_tick: usize,
+    last_tick: Instant,
     show_thinking: bool,
     /// 是否展开全部历史工具调用明细（默认智能折叠连续大段工具轨迹，按 Ctrl+O 或 /tools 切换）。
     show_tools: bool,
@@ -88,6 +92,9 @@ impl TuiState {
             entries,
             input: InputState::default(),
             pending_tasks: 0,
+            activity: None,
+            spinner_tick: 0,
+            last_tick: Instant::now(),
             show_thinking: false,
             show_tools: false,
             call_actions: HashMap::new(),
@@ -107,6 +114,13 @@ impl TuiState {
         self.last_usage = last_usage;
         self.scroll_offset = 0;
         self.auto_scroll = true;
+    }
+
+    fn set_activity(&mut self, label: impl Into<String>) {
+        let label = label.into();
+        if self.activity.as_ref().map(|(s, _)| s.as_str()) != Some(label.as_str()) {
+            self.activity = Some((label, Instant::now()));
+        }
     }
 
     fn append_thinking_delta(&mut self, delta: &str) {
@@ -387,9 +401,14 @@ pub async fn run_tui_with_runtime(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut active_cancel: Option<CancellationToken> = None;
+    let mut cancel_queue: VecDeque<CancellationToken> = VecDeque::new();
 
     let res = loop {
+        if state.is_running() && state.last_tick.elapsed() >= Duration::from_millis(90) {
+            state.spinner_tick = state.spinner_tick.wrapping_add(1);
+            state.last_tick = Instant::now();
+        }
+
         while let Ok(notif) = notif_rx.try_recv() {
             match notif {
                 ServerNotification::StreamDelta {
@@ -398,11 +417,24 @@ pub async fn run_tui_with_runtime(
                     ..
                 } => {
                     if let Some(r) = reasoning_delta {
+                        state.set_activity("模型思考中…");
                         state.append_thinking_delta(&r);
                     }
                     if let Some(t) = text_delta {
+                        state.set_activity("正在生成回复…");
                         state.append_text_delta(&t);
                     }
+                    state.auto_scroll = true;
+                }
+                ServerNotification::ToolStarted {
+                    tool_name, action, ..
+                } => {
+                    let label = if action.is_empty() {
+                        format!("正在执行 {tool_name}…")
+                    } else {
+                        format!("正在执行 {tool_name}: {action}")
+                    };
+                    state.activity = Some((label, Instant::now()));
                     state.auto_scroll = true;
                 }
                 ServerNotification::ApprovalRequired {
@@ -410,6 +442,7 @@ pub async fn run_tui_with_runtime(
                     tool_name,
                     summary,
                 } => {
+                    state.set_activity(format!("等待权限确认: {tool_name}"));
                     state.pending_approval = Some(PendingApproval {
                         call_id,
                         tool_name,
@@ -426,6 +459,17 @@ pub async fn run_tui_with_runtime(
                     state.rebuild_from_events(&events);
                 }
                 ServerNotification::EventAppended { event } => match event.kind {
+                    EventKind::TurnStarted { user_input, .. } => {
+                        let already_shown = matches!(
+                            state.entries.last(),
+                            Some(TranscriptEntry::User(s)) if s == &user_input
+                        );
+                        if !already_shown {
+                            state.entries.push(TranscriptEntry::User(user_input));
+                        }
+                        state.activity = Some(("等待模型响应…".to_string(), Instant::now()));
+                        state.auto_scroll = true;
+                    }
                     EventKind::AssistantMessage {
                         usage, tool_calls, ..
                     } => {
@@ -448,12 +492,16 @@ pub async fn run_tui_with_runtime(
                             output,
                             is_error,
                         });
+                        state.activity = Some(("等待模型继续推理…".to_string(), Instant::now()));
                         state.auto_scroll = true;
                     }
                     EventKind::TurnFinished { aborted } => {
                         state.pending_tasks = state.pending_tasks.saturating_sub(1);
+                        let _ = cancel_queue.pop_front();
                         if state.pending_tasks == 0 {
-                            active_cancel = None;
+                            state.activity = None;
+                        } else {
+                            state.activity = Some(("开始执行下一条排队指令…".to_string(), Instant::now()));
                         }
                         if aborted {
                             state.entries.push(TranscriptEntry::SystemInfo("（上一轮执行已中断）".to_string()));
@@ -492,7 +540,7 @@ pub async fn run_tui_with_runtime(
                 && key.kind == KeyEventKind::Press
             {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                if let Some(c) = active_cancel.take() {
+                for c in cancel_queue.drain(..) {
                     c.cancel();
                 }
                 break Ok(());
@@ -554,7 +602,7 @@ pub async fn run_tui_with_runtime(
 
             match key.code {
                 KeyCode::Esc => {
-                    if let Some(c) = active_cancel.take() {
+                    if let Some(c) = cancel_queue.front() {
                         c.cancel();
                         state.entries.push(TranscriptEntry::SystemInfo(
                             "正在中断当前执行…".to_string(),
@@ -661,16 +709,16 @@ pub async fn run_tui_with_runtime(
                     if state.input.text().trim().is_empty() {
                         continue;
                     }
-                    let trimmed = state.input.take_and_record();
-                    if matches!(trimmed.as_str(), "/quit" | "/exit") {
-                        if let Some(c) = active_cancel.take() {
+                    let raw_input = state.input.take_and_record();
+                    if matches!(raw_input.as_str(), "/quit" | "/exit") {
+                        for c in cancel_queue.drain(..) {
                             c.cancel();
                         }
                         break Ok(());
                     }
 
-                    // 纯本地界面命令无需打断后台任务
-                    match trimmed.as_str() {
+                    // 纯本地界面命令无需打断或排队
+                    match raw_input.as_str() {
                         "/help" => {
                             for l in [
                                 "可用命令：",
@@ -686,7 +734,8 @@ pub async fn run_tui_with_runtime(
                                 "  /thinking        切换思考过程展开/折叠（等同 Tab）",
                                 "  /clear           清空当前屏幕显示（不影响会话历史）",
                                 "  /quit            退出 gcode",
-                                "快捷键：滚轮/PgUp/PgDn 滚动对话 | ↑/↓ 历史 | Shift+左键复制(或 F2 切换) | Shift+Tab 权限模式 | Esc 中断",
+                                "运行中发指令：Enter=加入队列等待完成 | Alt+Enter 或 `!指令`=立即打断切入 | Esc=中断",
+                                "快捷键：滚轮/PgUp/PgDn 滚动 | ↑/↓ 历史 | Shift+左键复制(或 F2) | Shift+Tab 权限模式",
                             ] {
                                 state.entries.push(TranscriptEntry::SystemInfo(l.to_string()));
                             }
@@ -707,7 +756,7 @@ pub async fn run_tui_with_runtime(
                             continue;
                         }
                         "/copy" | "/copy all" => {
-                            let is_all = trimmed == "/copy all";
+                            let is_all = raw_input == "/copy all";
                             let text_opt = if is_all {
                                 let dump = render_plain_transcript(&state.entries);
                                 (!dump.trim().is_empty()).then_some(dump)
@@ -783,9 +832,20 @@ pub async fn run_tui_with_runtime(
                         _ => {}
                     }
 
-                    // 若当前有运行中的任务，直接打断它并无缝切入新指令
-                    if state.is_running() {
-                        if let Some(c) = active_cancel.take() {
+                    // 判断运行中是「立即打断」(Alt+Enter 或以 `!` 开头) 还是「默认排队」(直接 Enter)
+                    let (interrupt_now, trimmed) = if let Some(rest) = raw_input.strip_prefix('!') {
+                        let cleaned = rest.trim().to_string();
+                        if cleaned.is_empty() {
+                            continue;
+                        }
+                        (true, cleaned)
+                    } else {
+                        (key.modifiers.contains(KeyModifiers::ALT), raw_input)
+                    };
+
+                    let was_running = state.is_running();
+                    if was_running && interrupt_now {
+                        if let Some(c) = cancel_queue.front() {
                             c.cancel();
                         }
                         if let Some(approval) = state.pending_approval.take()
@@ -796,13 +856,21 @@ pub async fn run_tui_with_runtime(
                         state.entries.push(TranscriptEntry::SystemInfo(
                             "⚡ 已打断当前执行，切入新指令…".to_string(),
                         ));
+                    } else if was_running {
+                        let q_pos = state.pending_tasks;
+                        state.entries.push(TranscriptEntry::SystemInfo(format!(
+                            "⏳ 已加入队列 (#{q_pos}，当前任务完成后自动执行；如需立即打断请用 Alt+Enter 或 `!指令`)：{trimmed}"
+                        )));
                     }
 
                     match trimmed.as_str() {
                         "/compact" => {
                             let cancel = CancellationToken::new();
-                            active_cancel = Some(cancel.clone());
+                            cancel_queue.push_back(cancel.clone());
                             state.pending_tasks += 1;
+                            if !was_running {
+                                state.activity = Some(("正在压缩上下文…".to_string(), Instant::now()));
+                            }
                             state.auto_scroll = true;
                             let _ = task_tx.send(WorkerTask::Compact {
                                 turn_id: state.turn_counter,
@@ -810,11 +878,16 @@ pub async fn run_tui_with_runtime(
                             });
                         }
                         "/undo" => {
+                            cancel_queue.push_back(CancellationToken::new());
                             state.pending_tasks += 1;
+                            if !was_running {
+                                state.activity = Some(("正在撤销上一轮…".to_string(), Instant::now()));
+                            }
                             state.auto_scroll = true;
                             let _ = task_tx.send(WorkerTask::Undo);
                         }
                         "/turns" => {
+                            cancel_queue.push_back(CancellationToken::new());
                             state.pending_tasks += 1;
                             state.auto_scroll = true;
                             let _ = task_tx.send(WorkerTask::ListTurns);
@@ -823,7 +896,12 @@ pub async fn run_tui_with_runtime(
                             let arg = cmd.split_whitespace().nth(1).unwrap_or("");
                             match arg.trim_start_matches('#').parse::<u64>() {
                                 Ok(target_turn_id) => {
+                                    cancel_queue.push_back(CancellationToken::new());
                                     state.pending_tasks += 1;
+                                    if !was_running {
+                                        state.activity =
+                                            Some((format!("正在回滚至 Turn #{target_turn_id}…"), Instant::now()));
+                                    }
                                     state.auto_scroll = true;
                                     let _ = task_tx.send(WorkerTask::Fork { target_turn_id });
                                 }
@@ -838,9 +916,14 @@ pub async fn run_tui_with_runtime(
                         _ => {
                             state.turn_counter += 1;
                             let cancel = CancellationToken::new();
-                            active_cancel = Some(cancel.clone());
+                            cancel_queue.push_back(cancel.clone());
                             state.pending_tasks += 1;
-                            state.entries.push(TranscriptEntry::User(trimmed.clone()));
+                            if !was_running {
+                                state.activity = Some(("等待模型响应…".to_string(), Instant::now()));
+                                state.entries.push(TranscriptEntry::User(trimmed.clone()));
+                            } else if interrupt_now {
+                                state.entries.push(TranscriptEntry::User(trimmed.clone()));
+                            }
                             state.auto_scroll = true;
                             let _ = task_tx.send(WorkerTask::Prompt {
                                 turn_id: state.turn_counter,
@@ -894,9 +977,14 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     let total_prompt = state.last_usage.prompt_tokens.max(1);
     let cache_pct = (state.last_usage.cache_hit_tokens * 100) / total_prompt;
     let status = if state.is_running() {
-        "运行中 (Esc 中断 / 直接输入回车打断)"
+        let queued = state.pending_tasks.saturating_sub(1);
+        if queued > 0 {
+            format!("运行中 (排队 {queued} 条)")
+        } else {
+            "运行中".to_string()
+        }
     } else {
-        "空闲"
+        "空闲".to_string()
     };
     let header_text = format!(
         " 模型: {} | 权限: {} (Shift+Tab) | 状态: {} | 缓存: {}% ({}/{}) | 工作区: {}",
@@ -973,6 +1061,33 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         }
     }
 
+    if state.is_running() {
+        const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame_ch = SPINNER[state.spinner_tick % SPINNER.len()];
+        let (desc, elapsed_secs) = match &state.activity {
+            Some((label, started)) => (label.as_str(), started.elapsed().as_secs()),
+            None => ("正在处理中…", 0),
+        };
+        let queued = state.pending_tasks.saturating_sub(1);
+        let queue_hint = if queued > 0 {
+            format!(" | 队列待执行: {queued} 条")
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{frame_ch} {desc} "),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("({elapsed_secs}s{queue_hint})"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
     let view_height = chunks[1].height.saturating_sub(2);
     let inner_width = chunks[1].width.saturating_sub(2).max(1) as usize;
     let total_visual_lines: usize = lines
@@ -1019,12 +1134,13 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
             .wrap(Wrap { trim: false });
         frame.render_widget(panel, chunks[2]);
     } else {
+        let input_title = if state.is_running() {
+            " 运行中 (Enter 排队 | Alt+Enter 或 `!指令` 立即打断 | Esc 中断) "
+        } else {
+            " 输入指令 (Enter 发送 | ↑/↓ 历史 | 滚轮滚动 | Ctrl+O 工具明细 | /help) "
+        };
         let input = Paragraph::new(format!("> {}", state.input.text()))
-            .block(
-                Block::default()
-                    .title(" 输入指令 (Enter 发送 | ↑/↓ 历史 | 滚轮滚动 | Shift+左键复制 / F2 切换 | /help) ")
-                    .borders(Borders::ALL),
-            );
+            .block(Block::default().title(input_title).borders(Borders::ALL));
         frame.render_widget(input, chunks[2]);
 
         // 将终端硬件光标精准定位到当前编辑位置（+1 左边框，+2 "> " 前缀）
