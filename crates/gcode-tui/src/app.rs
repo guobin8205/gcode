@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -13,7 +13,7 @@ use gcode_core::{AgentRuntime, ApprovalOutcome, ChannelApprovalHandler, Permissi
 use gcode_protocol::{EventKind, ServerNotification, SessionEvent, TokenUsage, ToolCall};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -66,8 +66,12 @@ struct TuiState {
     last_usage: TokenUsage,
     pending_approval: Option<PendingApproval>,
     permission_mode: PermissionMode,
-    /// 是否捕获鼠标用于滚轮滚动；默认关闭以允许终端直接用鼠标左键划选复制文本。
+    /// 是否捕获鼠标用于滚轮滚动与原生左键划选复制。
     mouse_capture: bool,
+    /// 当前对话区内容矩形（不含四周边框），用于精准划选与自动剥离边框。
+    transcript_inner: Rect,
+    /// 鼠标左键拖拽选区 `(起点(x,y), 终点(x,y))`。
+    selection: Option<((u16, u16), (u16, u16))>,
     turn_counter: u64,
 }
 
@@ -104,6 +108,8 @@ impl TuiState {
             pending_approval: None,
             permission_mode,
             mouse_capture: true,
+            transcript_inner: Rect::default(),
+            selection: None,
             turn_counter,
         }
     }
@@ -530,11 +536,49 @@ pub async fn run_tui_with_runtime(
             if let Event::Mouse(mouse) = ev {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
+                        state.selection = None;
                         state.auto_scroll = false;
                         state.scroll_offset = state.scroll_offset.saturating_sub(3);
                     }
                     MouseEventKind::ScrollDown => {
+                        state.selection = None;
                         state.scroll_offset = state.scroll_offset.saturating_add(3);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if point_in_rect(mouse.column, mouse.row, state.transcript_inner) {
+                            state.selection = Some(((mouse.column, mouse.row), (mouse.column, mouse.row)));
+                        } else {
+                            state.selection = None;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some((start, _)) = state.selection {
+                            let cx = clamp_x(mouse.column, state.transcript_inner);
+                            let cy = clamp_y(mouse.row, state.transcript_inner);
+                            state.selection = Some((start, (cx, cy)));
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some((start, end)) = state.selection.take()
+                            && start != end
+                        {
+                            let selected = extract_selected_text(
+                                terminal.current_buffer_mut(),
+                                state.transcript_inner,
+                                start,
+                                end,
+                            );
+                            if !selected.trim().is_empty() {
+                                match copy_to_clipboard(&selected) {
+                                    Ok(()) => state.entries.push(TranscriptEntry::SystemInfo(
+                                        format!("已复制选中内容到剪贴板（{} 字）。", selected.chars().count()),
+                                    )),
+                                    Err(e) => state.entries.push(TranscriptEntry::SystemInfo(
+                                        format!("复制选中内容失败: {e}"),
+                                    )),
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1025,9 +1069,10 @@ pub async fn run_tui_with_runtime(
 fn set_mouse_capture<W: std::io::Write>(w: &mut W, enabled: bool) -> std::io::Result<()> {
     if enabled {
         execute!(w, EnableMouseCapture)?;
-        w.write_all(b"\x1b[?1007l\x1b[?1000h\x1b[?1006h")?;
+        // ?1007l 禁用滚轮→上下箭头转换；?1000h+?1002h+?1006h 启用点击/拖拽/滚轮 SGR 事件
+        w.write_all(b"\x1b[?1007l\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
     } else {
-        w.write_all(b"\x1b[?1006l\x1b[?1000l")?;
+        w.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?;
         execute!(w, DisableMouseCapture)?;
     }
     w.flush()
@@ -1180,11 +1225,25 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         }
     }
 
+    state.transcript_inner = Rect {
+        x: chunks[1].x + 1,
+        y: chunks[1].y + 1,
+        width: chunks[1].width.saturating_sub(2),
+        height: chunks[1].height.saturating_sub(2),
+    };
+
     let transcript = Paragraph::new(lines)
-        .block(Block::default().title(" 对话与执行轨迹 ").borders(Borders::ALL))
+        .block(Block::default().title(" 对话与执行轨迹（左键拖拽自动复制 | 滚轮滚动） ").borders(Borders::ALL))
         .wrap(Wrap { trim: false })
         .scroll((state.scroll_offset, 0));
     frame.render_widget(transcript, chunks[1]);
+
+    // 实时高亮鼠标左键拖拽选区
+    if let Some((start, end)) = state.selection
+        && start != end
+    {
+        highlight_selection(frame.buffer_mut(), state.transcript_inner, start, end);
+    }
 
     if let Some(approval) = &state.pending_approval {
         let max_diff = bottom_height.saturating_sub(4) as usize;
@@ -1554,4 +1613,114 @@ fn paste_from_clipboard() -> Result<String> {
         anyhow::bail!("读取剪贴板失败: {}", out.status);
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
+    r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+fn clamp_x(x: u16, r: Rect) -> u16 {
+    if r.width == 0 {
+        r.x
+    } else {
+        x.clamp(r.x, r.x + r.width - 1)
+    }
+}
+
+fn clamp_y(y: u16, r: Rect) -> u16 {
+    if r.height == 0 {
+        r.y
+    } else {
+        y.clamp(r.y, r.y + r.height - 1)
+    }
+}
+
+fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if a.1 < b.1 || (a.1 == b.1 && a.0 <= b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn highlight_selection(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    a: (u16, u16),
+    b: (u16, u16),
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let ((sx, sy), (ex, ey)) = normalize_selection(a, b);
+    let y_min = sy.max(area.y);
+    let y_max = ey.min(area.y + area.height - 1);
+    for y in y_min..=y_max {
+        let x_start = if y == sy { sx.max(area.x) } else { area.x };
+        let x_end = if y == ey {
+            ex.min(area.x + area.width - 1)
+        } else {
+            area.x + area.width - 1
+        };
+        for x in x_start..=x_end {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(Color::Blue).set_fg(Color::White);
+            }
+        }
+    }
+}
+
+fn extract_selected_text(
+    buf: &ratatui::buffer::Buffer,
+    area: Rect,
+    a: (u16, u16),
+    b: (u16, u16),
+) -> String {
+    if area.width == 0 || area.height == 0 {
+        return String::new();
+    }
+    let ((sx, sy), (ex, ey)) = normalize_selection(a, b);
+    let y_min = sy.max(area.y);
+    let y_max = ey.min(area.y + area.height - 1);
+    let mut lines = Vec::new();
+    for y in y_min..=y_max {
+        let x_start = if y == sy { sx.max(area.x) } else { area.x };
+        let x_end = if y == ey {
+            ex.min(area.x + area.width - 1)
+        } else {
+            area.x + area.width - 1
+        };
+        let mut row_str = String::new();
+        let mut x = x_start;
+        while x <= x_end {
+            if let Some(cell) = buf.cell((x, y)) {
+                let sym = cell.symbol();
+                if !sym.is_empty() {
+                    row_str.push_str(sym);
+                    let w = Line::raw(sym).width().max(1) as u16;
+                    x = x.saturating_add(w);
+                    continue;
+                }
+            }
+            x += 1;
+        }
+        lines.push(row_str.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn extracts_selected_text_without_borders() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 4));
+        buf.set_string(1, 1, "hello 世界", Style::default());
+        buf.set_string(1, 2, "second line", Style::default());
+        let area = Rect::new(1, 1, 18, 2);
+        let text = extract_selected_text(&buf, area, (1, 1), (6, 2));
+        assert_eq!(text, "hello 世界\nsecond");
+    }
 }
