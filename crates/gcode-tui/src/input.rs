@@ -34,6 +34,22 @@ impl InputState {
         self.history_idx = None;
     }
 
+    /// 一次性插入多行粘贴文本（自动将 `\r\n`/`\r` 归一化为 `\n`，不触发提交）。
+    pub fn insert_str(&mut self, raw: &str) {
+        let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+        let byte_idx = self.byte_index_of(self.cursor);
+        self.buf.insert_str(byte_idx, &normalized);
+        self.cursor += normalized.chars().count();
+        self.history_idx = None;
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.buf.split('\n').count().max(1)
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
@@ -138,15 +154,32 @@ impl InputState {
 
     /// 计算光标前的终端视觉列宽（借助 Ratatui 内置 Unicode 宽度，准确兼容中文双宽字符）。
     pub fn cursor_visual_width(&self) -> u16 {
+        self.cursor_line_and_col().1
+    }
+
+    /// 计算光标在多行输入中的 `(行号, 当前行列视觉宽度)`（均从 0 开始）。
+    pub fn cursor_line_and_col(&self) -> (u16, u16) {
         let byte_idx = self.byte_index_of(self.cursor);
         let prefix = &self.buf[..byte_idx];
-        Line::raw(prefix).width().min(u16::MAX as usize) as u16
+        let row = prefix.bytes().filter(|&b| b == b'\n').count().min(u16::MAX as usize) as u16;
+        let current_line_prefix = prefix.rsplit('\n').next().unwrap_or(prefix);
+        let col = Line::raw(current_line_prefix).width().min(u16::MAX as usize) as u16;
+        (row, col)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracketed_paste_preserves_multiline_without_splitting() {
+        let mut input = InputState::default();
+        input.insert_str("line1\r\n第二行\rline3");
+        assert_eq!(input.text(), "line1\n第二行\nline3");
+        assert_eq!(input.line_count(), 3);
+        assert_eq!(input.cursor_line_and_col(), (2, 5));
+    }
 
     #[test]
     fn handles_chinese_cursor_movement_and_edits() {

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -394,9 +394,8 @@ pub async fn run_tui_with_runtime(
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    // 默认开启鼠标滚轮捕获：同时发送 VT 序列禁用 Alternate Scroll Mode（?1007l，防止终端把滚轮转成 ↑/↓）
-    // 并启用 SGR 鼠标事件（?1000h + ?1006h），兼容 Windows Terminal / VS Code 终端 / ConPTY。
-    execute!(stdout, EnterAlternateScreen)?;
+    // 默认开启 Bracketed Paste（粘贴多行文本不会逐行自动提交）和鼠标滚轮捕获
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     set_mouse_capture(&mut stdout, true)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -533,6 +532,12 @@ pub async fn run_tui_with_runtime(
                         state.scroll_offset = state.scroll_offset.saturating_add(3);
                     }
                     _ => {}
+                }
+                continue;
+            }
+            if let Event::Paste(pasted) = ev {
+                if state.pending_approval.is_none() {
+                    state.input.insert_str(&pasted);
                 }
                 continue;
             }
@@ -704,6 +709,12 @@ pub async fn run_tui_with_runtime(
                 }
                 KeyCode::Char(c) => {
                     state.input.insert_char(c);
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    state.input.insert_char('\n');
+                }
+                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.input.insert_char('\n');
                 }
                 KeyCode::Enter => {
                     if state.input.text().trim().is_empty() {
@@ -941,7 +952,11 @@ pub async fn run_tui_with_runtime(
 
     disable_raw_mode()?;
     let _ = set_mouse_capture(terminal.backend_mut(), false);
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     res
 }
@@ -963,7 +978,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         let diff_lines = approval.summary.lines().count().min(8);
         (diff_lines as u16 + 4).clamp(6, 12)
     } else {
-        3
+        (state.input.line_count() as u16 + 2).clamp(3, 8)
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1135,18 +1150,34 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         frame.render_widget(panel, chunks[2]);
     } else {
         let input_title = if state.is_running() {
-            " 运行中 (Enter 排队 | Alt+Enter 或 `!指令` 立即打断 | Esc 中断) "
+            " 运行中 (Enter 排队 | Alt+Enter 或 `!指令` 立即打断 | Shift+Enter 换行 | Esc 中断) "
         } else {
-            " 输入指令 (Enter 发送 | ↑/↓ 历史 | 滚轮滚动 | Ctrl+O 工具明细 | /help) "
+            " 输入指令 (Enter 发送 | Shift+Enter 换行 | 支持多行粘贴 | ↑/↓ 历史 | /help) "
         };
-        let input = Paragraph::new(format!("> {}", state.input.text()))
-            .block(Block::default().title(input_title).borders(Borders::ALL));
+        let (cursor_row, cursor_col) = state.input.cursor_line_and_col();
+        let inner_rows = chunks[2].height.saturating_sub(2).max(1);
+        let input_scroll_y = cursor_row.saturating_sub(inner_rows.saturating_sub(1));
+
+        let display_lines: Vec<Line<'_>> = state
+            .input
+            .text()
+            .split('\n')
+            .enumerate()
+            .map(|(idx, line)| {
+                let prefix = if idx == 0 { "> " } else { "  " };
+                Line::raw(format!("{prefix}{line}"))
+            })
+            .collect();
+        let input = Paragraph::new(display_lines)
+            .block(Block::default().title(input_title).borders(Borders::ALL))
+            .scroll((input_scroll_y, 0));
         frame.render_widget(input, chunks[2]);
 
-        // 将终端硬件光标精准定位到当前编辑位置（+1 左边框，+2 "> " 前缀）
+        // 将终端硬件光标精准定位到多行输入中的当前编辑位置（+1 左边框，+2 "> "/"  " 前缀）
         let max_x = chunks[2].x + chunks[2].width.saturating_sub(2);
-        let cursor_x = (chunks[2].x + 3 + state.input.cursor_visual_width()).min(max_x);
-        let cursor_y = chunks[2].y + 1;
+        let max_y = chunks[2].y + chunks[2].height.saturating_sub(2);
+        let cursor_x = (chunks[2].x + 3 + cursor_col).min(max_x);
+        let cursor_y = (chunks[2].y + 1 + cursor_row.saturating_sub(input_scroll_y)).min(max_y);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
