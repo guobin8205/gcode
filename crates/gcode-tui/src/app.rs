@@ -380,9 +380,10 @@ pub async fn run_tui_with_runtime(
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    // 默认开启 EnableMouseCapture：鼠标滚轮专门滚动对话记录，与 ↑/↓ 翻历史彻底分离；
-    // 划选复制请按住 Shift+鼠标左键，或按 F2 / 输入 /mouse 临时切换，或使用 /copy 复制。
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // 默认开启鼠标滚轮捕获：同时发送 VT 序列禁用 Alternate Scroll Mode（?1007l，防止终端把滚轮转成 ↑/↓）
+    // 并启用 SGR 鼠标事件（?1000h + ?1006h），兼容 Windows Terminal / VS Code 终端 / ConPTY。
+    execute!(stdout, EnterAlternateScreen)?;
+    set_mouse_capture(&mut stdout, true)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -566,13 +567,12 @@ pub async fn run_tui_with_runtime(
                 }
                 KeyCode::F(2) => {
                     state.mouse_capture = !state.mouse_capture;
+                    let _ = set_mouse_capture(terminal.backend_mut(), state.mouse_capture);
                     if state.mouse_capture {
-                        let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
                         state.entries.push(TranscriptEntry::SystemInfo(
                             "鼠标模式：滚轮滚动对话（按住 Shift+左键可划选复制，F2 切换）。".to_string(),
                         ));
                     } else {
-                        let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
                         state.entries.push(TranscriptEntry::SystemInfo(
                             "鼠标模式：自由左键划选复制（按 F2 恢复滚轮滚动）。".to_string(),
                         ));
@@ -741,15 +741,14 @@ pub async fn run_tui_with_runtime(
                         }
                         "/mouse" => {
                             state.mouse_capture = !state.mouse_capture;
+                            let _ = set_mouse_capture(terminal.backend_mut(), state.mouse_capture);
                             if state.mouse_capture {
-                                let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
                                 state.entries.push(TranscriptEntry::SystemInfo(
-                                    "已开启鼠标滚轮滚动（划选复制需按住 Shift+左键，或再次输入 /mouse 关闭）。".to_string(),
+                                    "已开启鼠标滚轮滚动（划选复制需按住 Shift+左键，或再次按 F2 / 输入 /mouse 关闭）。".to_string(),
                                 ));
                             } else {
-                                let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
                                 state.entries.push(TranscriptEntry::SystemInfo(
-                                    "已关闭鼠标捕获，现在可直接用鼠标左键划选复制文本（滚动用 PgUp/PgDn/Shift+↑↓）。".to_string(),
+                                    "已关闭鼠标捕获，现在可直接用鼠标左键划选复制文本（按 F2 恢复滚轮滚动）。".to_string(),
                                 ));
                             }
                             state.auto_scroll = true;
@@ -858,13 +857,22 @@ pub async fn run_tui_with_runtime(
     };
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    let _ = set_mouse_capture(terminal.backend_mut(), false);
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     res
+}
+
+/// 统一开关终端鼠标捕获：兼顾 Win32 Console API 与 VT ANSI 控制序列（禁用 `?1007l` 防止滚轮被转成上下箭头）。
+fn set_mouse_capture<W: std::io::Write>(w: &mut W, enabled: bool) -> std::io::Result<()> {
+    if enabled {
+        execute!(w, EnableMouseCapture)?;
+        w.write_all(b"\x1b[?1007l\x1b[?1000h\x1b[?1006h")?;
+    } else {
+        w.write_all(b"\x1b[?1006l\x1b[?1000l")?;
+        execute!(w, DisableMouseCapture)?;
+    }
+    w.flush()
 }
 
 fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
