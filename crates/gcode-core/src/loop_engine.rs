@@ -121,6 +121,7 @@ impl AgentRuntime {
         let tool_defs = self.tools.definitions();
         let has_tools = !tool_defs.is_empty();
         let mut step_id = 1;
+        let mut last_auto_compact_tokens: usize = 0;
 
         loop {
             if cancel.is_cancelled() {
@@ -131,16 +132,38 @@ impl AgentRuntime {
                 break;
             }
 
-            // 自动检查是否触及上下文压缩阈值：优先执行两段式全量压缩（保留最近 2 个 Turn）
-            let projected_before = self.store.project_messages();
-            let est_tokens = estimate_messages_tokens(&projected_before);
-            if est_tokens >= self.auto_compact_threshold {
+            // 第一步：先按模型规范清洗旧思考链，并在超阈值时执行无损 Micro-Compaction 折叠早期大工具输出
+            let mut raw_history = self
+                .profile
+                .prepare_messages(&self.store.project_messages(), has_tools);
+            if estimate_messages_tokens(&raw_history) >= self.micro_compact_threshold {
+                raw_history = micro_compact_messages(
+                    raw_history,
+                    DEFAULT_KEEP_RECENT_TOOLS,
+                    DEFAULT_MAX_OLD_TOOL_CHARS,
+                );
+            }
+
+            // 第二步：仅在 Micro-Compaction 后仍超过全量压缩阈值、且存在可切分的旧 Turn、且距上次自动压缩增长 >= 20k 时才触发
+            let est_tokens = estimate_messages_tokens(&raw_history);
+            let active_events = self.store.active_events();
+            let can_split = find_compaction_split(&active_events, 2).is_some()
+                || find_compaction_split(&active_events, 1).is_some();
+            if est_tokens >= self.auto_compact_threshold
+                && can_split
+                && est_tokens >= last_auto_compact_tokens.saturating_add(20_000)
+            {
+                let keep_turns = if find_compaction_split(&active_events, 2).is_some() {
+                    2
+                } else {
+                    1
+                };
                 let _ = tx.send(ServerNotification::StatusMessage {
                     message: format!(
                         "上下文估算已达 ~{est_tokens} tokens，正在自动执行静默记忆落盘与上下文压缩…"
                     ),
                 });
-                let _ = self.compact(turn_id, 2, cancel.clone(), tx).await?;
+                let report = self.compact(turn_id, keep_turns, cancel.clone(), tx).await?;
                 if cancel.is_cancelled() {
                     let ev = self.store.append(
                         turn_id,
@@ -150,6 +173,23 @@ impl AgentRuntime {
                     let _ = tx.send(ServerNotification::EventAppended { event: ev });
                     break;
                 }
+                if report.compacted {
+                    let _ = tx.send(ServerNotification::StatusMessage {
+                        message: report.reason,
+                    });
+                }
+                // 压缩后重新投影并记录水位线，防止同 Turn 内反复触发
+                raw_history = self
+                    .profile
+                    .prepare_messages(&self.store.project_messages(), has_tools);
+                if estimate_messages_tokens(&raw_history) >= self.micro_compact_threshold {
+                    raw_history = micro_compact_messages(
+                        raw_history,
+                        DEFAULT_KEEP_RECENT_TOOLS,
+                        DEFAULT_MAX_OLD_TOOL_CHARS,
+                    );
+                }
+                last_auto_compact_tokens = estimate_messages_tokens(&raw_history);
             }
 
             // 字节级稳定的前缀缓存拼装顺序：System -> Tools (BTreeMap) -> History
@@ -160,16 +200,7 @@ impl AgentRuntime {
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }];
-            let mut raw_history = self.store.project_messages();
-            if estimate_messages_tokens(&raw_history) >= self.micro_compact_threshold {
-                raw_history = micro_compact_messages(
-                    raw_history,
-                    DEFAULT_KEEP_RECENT_TOOLS,
-                    DEFAULT_MAX_OLD_TOOL_CHARS,
-                );
-            }
-            let history = self.profile.prepare_messages(&raw_history, has_tools);
-            messages.extend(history);
+            messages.extend(raw_history);
 
             let req = ModelRequest {
                 model_id: self.profile.model_id.clone(),

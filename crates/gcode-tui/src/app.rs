@@ -55,6 +55,8 @@ struct TuiState {
     last_usage: TokenUsage,
     pending_approval: Option<PendingApproval>,
     permission_mode: PermissionMode,
+    /// 是否捕获鼠标用于滚轮滚动；默认关闭以允许终端直接用鼠标左键划选复制文本。
+    mouse_capture: bool,
     turn_counter: u64,
 }
 
@@ -85,6 +87,7 @@ impl TuiState {
             last_usage,
             pending_approval: None,
             permission_mode,
+            mouse_capture: false,
             turn_counter,
         }
     }
@@ -361,7 +364,8 @@ pub async fn run_tui_with_runtime(
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // 默认不启用 EnableMouseCapture，保证终端内可直接用鼠标左键划选复制对话内容；需要滚轮时可用 /mouse 开启
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -633,10 +637,12 @@ pub async fn run_tui_with_runtime(
                                 "  /fork <轮次号>   回滚至指定轮次执行前（别名 /rollback）",
                                 "  /yolo            切换为全自动免确认模式（等同 /mode yolo）",
                                 "  /mode <模式>     切换权限模式：auto（默认编辑免问）| yolo | ask",
+                                "  /copy            复制最后一条助手回复到系统剪贴板",
+                                "  /mouse           开关鼠标滚轮捕获（默认关闭以便直接鼠标划选复制）",
                                 "  /thinking        切换思考过程展开/折叠（等同 Tab）",
                                 "  /clear           清空当前屏幕显示（不影响会话历史）",
                                 "  /quit            退出 gcode",
-                                "快捷键：Shift+Tab 切换权限模式 | 运行中直接回车打断 | ↑/↓ 历史 | 滚轮/PgUp/PgDn 滚动 | Esc 中断",
+                                "快捷键：Shift+Tab 切换权限模式 | 运行中直接回车打断 | ↑/↓ 历史 | PgUp/PgDn/Shift+↑↓ 滚动 | Esc 中断",
                             ] {
                                 state.entries.push(TranscriptEntry::SystemInfo(l.to_string()));
                             }
@@ -650,6 +656,43 @@ pub async fn run_tui_with_runtime(
                         }
                         "/thinking" => {
                             state.show_thinking = !state.show_thinking;
+                            continue;
+                        }
+                        "/copy" => {
+                            let last_reply = state.entries.iter().rev().find_map(|e| match e {
+                                TranscriptEntry::Assistant(s) if !s.trim().is_empty() => Some(s.as_str()),
+                                _ => None,
+                            });
+                            match last_reply {
+                                Some(text) => match copy_to_clipboard(text) {
+                                    Ok(()) => state.entries.push(TranscriptEntry::SystemInfo(
+                                        format!("已复制最后一条助手回复到剪贴板（{} 字）。", text.chars().count()),
+                                    )),
+                                    Err(e) => state.entries.push(TranscriptEntry::SystemInfo(
+                                        format!("复制失败: {e}"),
+                                    )),
+                                },
+                                None => state.entries.push(TranscriptEntry::SystemInfo(
+                                    "当前没有可复制的助手回复。".to_string(),
+                                )),
+                            }
+                            state.auto_scroll = true;
+                            continue;
+                        }
+                        "/mouse" => {
+                            state.mouse_capture = !state.mouse_capture;
+                            if state.mouse_capture {
+                                let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+                                state.entries.push(TranscriptEntry::SystemInfo(
+                                    "已开启鼠标滚轮滚动（划选复制需按住 Shift+左键，或再次输入 /mouse 关闭）。".to_string(),
+                                ));
+                            } else {
+                                let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+                                state.entries.push(TranscriptEntry::SystemInfo(
+                                    "已关闭鼠标捕获，现在可直接用鼠标左键划选复制文本（滚动用 PgUp/PgDn/Shift+↑↓）。".to_string(),
+                                ));
+                            }
+                            state.auto_scroll = true;
                             continue;
                         }
                         "/yolo" => {
@@ -910,7 +953,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         let input = Paragraph::new(format!("> {}", state.input.text()))
             .block(
                 Block::default()
-                    .title(" 输入指令 (Enter 发送 | ↑/↓ 历史 | 滚轮/PgUp/PgDn 滚动 | /help 帮助) ")
+                    .title(" 输入指令 (Enter 发送 | ↑/↓ 历史 | PgUp/PgDn 滚动 | /copy 复制 | /help 帮助) ")
                     .borders(Borders::ALL),
             );
         frame.render_widget(input, chunks[2]);
@@ -921,4 +964,37 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         let cursor_y = chunks[2].y + 1;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+/// 跨平台将文本写入系统剪贴板（Windows 使用 `clip`，macOS 使用 `pbcopy`，Linux 使用 `xclip`）。
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("powershell");
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::In.ReadToEnd() | Set-Clipboard",
+        ]);
+        c
+    } else if cfg!(target_os = "macos") {
+        Command::new("pbcopy")
+    } else {
+        let mut c = Command::new("xclip");
+        c.args(["-selection", "clipboard"]);
+        c
+    };
+
+    let mut child = cmd.stdin(Stdio::piped()).spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("剪贴板命令退出码: {status}");
+    }
+    Ok(())
 }
