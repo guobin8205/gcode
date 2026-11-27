@@ -707,13 +707,13 @@ pub async fn run_tui_with_runtime(
                 KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.input.history_next();
                 }
+                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.input.insert_char('\n');
+                }
                 KeyCode::Char(c) => {
                     state.input.insert_char(c);
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.input.insert_char('\n');
-                }
-                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.input.insert_char('\n');
                 }
                 KeyCode::Enter => {
