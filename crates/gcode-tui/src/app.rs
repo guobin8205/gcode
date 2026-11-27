@@ -401,8 +401,13 @@ pub async fn run_tui_with_runtime(
     let mut terminal = Terminal::new(backend)?;
 
     let mut cancel_queue: VecDeque<CancellationToken> = VecDeque::new();
+    let mut last_char_at: Option<Instant> = None;
+    let mut in_paste_burst = false;
 
     let res = loop {
+        if in_paste_burst && last_char_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(40)) {
+            in_paste_burst = false;
+        }
         if state.is_running() && state.last_tick.elapsed() >= Duration::from_millis(90) {
             state.spinner_tick = state.spinner_tick.wrapping_add(1);
             state.last_tick = Instant::now();
@@ -710,13 +715,39 @@ pub async fn run_tui_with_runtime(
                 KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.input.insert_char('\n');
                 }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Ok(text) = paste_from_clipboard() {
+                        state.input.insert_str(&text);
+                    }
+                }
                 KeyCode::Char(c) => {
+                    let now = Instant::now();
+                    if last_char_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(12))
+                        || event::poll(Duration::ZERO).unwrap_or(false)
+                    {
+                        in_paste_burst = true;
+                    }
+                    last_char_at = Some(now);
                     state.input.insert_char(c);
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     state.input.insert_char('\n');
                 }
                 KeyCode::Enter => {
+                    // Windows 下终端右键/Ctrl+Shift+V 粘贴会以爆发式 Key 事件涌入队列：
+                    // 若 8ms 内紧跟后续按键，或刚处于高速粘贴流中，则把 Enter 当作换行而非提交。
+                    let is_paste_newline = !key.modifiers.contains(KeyModifiers::ALT)
+                        && (event::poll(Duration::from_millis(8)).unwrap_or(false)
+                            || (in_paste_burst
+                                && last_char_at
+                                    .is_some_and(|t| t.elapsed() < Duration::from_millis(30))));
+                    if is_paste_newline {
+                        in_paste_burst = true;
+                        last_char_at = Some(Instant::now());
+                        state.input.insert_char('\n');
+                        continue;
+                    }
+                    in_paste_burst = false;
                     if state.input.text().trim().is_empty() {
                         continue;
                     }
@@ -1467,4 +1498,31 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
         anyhow::bail!("剪贴板命令退出码: {status}");
     }
     Ok(())
+}
+
+/// 跨平台从系统剪贴板读取 UTF-8 文本，供 `Ctrl+V` 无损粘贴多行内容。
+fn paste_from_clipboard() -> Result<String> {
+    use std::process::Command;
+
+    let out = if cfg!(windows) {
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw",
+            ])
+            .output()?
+    } else if cfg!(target_os = "macos") {
+        Command::new("pbpaste").output()?
+    } else {
+        Command::new("xclip")
+            .args(["-o", "-selection", "clipboard"])
+            .output()?
+    };
+
+    if !out.status.success() {
+        anyhow::bail!("读取剪贴板失败: {}", out.status);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
