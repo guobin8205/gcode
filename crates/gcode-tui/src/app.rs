@@ -87,7 +87,7 @@ impl TuiState {
             last_usage,
             pending_approval: None,
             permission_mode,
-            mouse_capture: false,
+            mouse_capture: true,
             turn_counter,
         }
     }
@@ -364,8 +364,9 @@ pub async fn run_tui_with_runtime(
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    // 默认不启用 EnableMouseCapture，保证终端内可直接用鼠标左键划选复制对话内容；需要滚轮时可用 /mouse 开启
-    execute!(stdout, EnterAlternateScreen)?;
+    // 默认开启 EnableMouseCapture：鼠标滚轮专门滚动对话记录，与 ↑/↓ 翻历史彻底分离；
+    // 划选复制请按住 Shift+鼠标左键，或按 F2 / 输入 /mouse 临时切换，或使用 /copy 复制。
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -539,6 +540,21 @@ pub async fn run_tui_with_runtime(
                 KeyCode::Tab => {
                     state.show_thinking = !state.show_thinking;
                 }
+                KeyCode::F(2) => {
+                    state.mouse_capture = !state.mouse_capture;
+                    if state.mouse_capture {
+                        let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+                        state.entries.push(TranscriptEntry::SystemInfo(
+                            "鼠标模式：滚轮滚动对话（按住 Shift+左键可划选复制，F2 切换）。".to_string(),
+                        ));
+                    } else {
+                        let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+                        state.entries.push(TranscriptEntry::SystemInfo(
+                            "鼠标模式：自由左键划选复制（按 F2 恢复滚轮滚动）。".to_string(),
+                        ));
+                    }
+                    state.auto_scroll = true;
+                }
                 KeyCode::BackTab => {
                     let next = state.permission_mode.cycle();
                     state.permission_mode = next;
@@ -637,12 +653,12 @@ pub async fn run_tui_with_runtime(
                                 "  /fork <轮次号>   回滚至指定轮次执行前（别名 /rollback）",
                                 "  /yolo            切换为全自动免确认模式（等同 /mode yolo）",
                                 "  /mode <模式>     切换权限模式：auto（默认编辑免问）| yolo | ask",
-                                "  /copy            复制最后一条助手回复到系统剪贴板",
-                                "  /mouse           开关鼠标滚轮捕获（默认关闭以便直接鼠标划选复制）",
+                                "  /copy [all]      复制最后一条助手回复（加 all 复制全部对话记录）到剪贴板",
+                                "  /mouse           开关鼠标滚轮捕获（等同 F2；开启时按住 Shift+左键可复制）",
                                 "  /thinking        切换思考过程展开/折叠（等同 Tab）",
                                 "  /clear           清空当前屏幕显示（不影响会话历史）",
                                 "  /quit            退出 gcode",
-                                "快捷键：Shift+Tab 切换权限模式 | 运行中直接回车打断 | ↑/↓ 历史 | PgUp/PgDn/Shift+↑↓ 滚动 | Esc 中断",
+                                "快捷键：滚轮/PgUp/PgDn 滚动对话 | ↑/↓ 历史 | Shift+左键复制(或 F2 切换) | Shift+Tab 权限模式 | Esc 中断",
                             ] {
                                 state.entries.push(TranscriptEntry::SystemInfo(l.to_string()));
                             }
@@ -658,22 +674,34 @@ pub async fn run_tui_with_runtime(
                             state.show_thinking = !state.show_thinking;
                             continue;
                         }
-                        "/copy" => {
-                            let last_reply = state.entries.iter().rev().find_map(|e| match e {
-                                TranscriptEntry::Assistant(s) if !s.trim().is_empty() => Some(s.as_str()),
-                                _ => None,
-                            });
-                            match last_reply {
-                                Some(text) => match copy_to_clipboard(text) {
+                        "/copy" | "/copy all" => {
+                            let is_all = trimmed == "/copy all";
+                            let text_opt = if is_all {
+                                let dump = render_plain_transcript(&state.entries);
+                                (!dump.trim().is_empty()).then_some(dump)
+                            } else {
+                                state.entries.iter().rev().find_map(|e| match e {
+                                    TranscriptEntry::Assistant(s) if !s.trim().is_empty() => {
+                                        Some(s.clone())
+                                    }
+                                    _ => None,
+                                })
+                            };
+                            match text_opt {
+                                Some(text) => match copy_to_clipboard(&text) {
                                     Ok(()) => state.entries.push(TranscriptEntry::SystemInfo(
-                                        format!("已复制最后一条助手回复到剪贴板（{} 字）。", text.chars().count()),
+                                        format!(
+                                            "已复制{}到剪贴板（{} 字）。",
+                                            if is_all { "全部对话记录" } else { "最后一条助手回复" },
+                                            text.chars().count()
+                                        ),
                                     )),
                                     Err(e) => state.entries.push(TranscriptEntry::SystemInfo(
                                         format!("复制失败: {e}"),
                                     )),
                                 },
                                 None => state.entries.push(TranscriptEntry::SystemInfo(
-                                    "当前没有可复制的助手回复。".to_string(),
+                                    "当前没有可复制的内容。".to_string(),
                                 )),
                             }
                             state.auto_scroll = true;
@@ -953,7 +981,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         let input = Paragraph::new(format!("> {}", state.input.text()))
             .block(
                 Block::default()
-                    .title(" 输入指令 (Enter 发送 | ↑/↓ 历史 | PgUp/PgDn 滚动 | /copy 复制 | /help 帮助) ")
+                    .title(" 输入指令 (Enter 发送 | ↑/↓ 历史 | 滚轮滚动 | Shift+左键复制 / F2 切换 | /help) ")
                     .borders(Borders::ALL),
             );
         frame.render_widget(input, chunks[2]);
@@ -964,6 +992,28 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         let cursor_y = chunks[2].y + 1;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+/// 将当前界面对话与工具轨迹导出为纯文本，供 `/copy all` 一键复制。
+fn render_plain_transcript(entries: &[TranscriptEntry]) -> String {
+    let mut out = Vec::new();
+    for entry in entries {
+        match entry {
+            TranscriptEntry::User(s) => out.push(format!("> {s}")),
+            TranscriptEntry::Assistant(s) => out.push(s.clone()),
+            TranscriptEntry::ToolResult {
+                name,
+                output,
+                is_error,
+            } => {
+                let mark = if *is_error { "✗" } else { "✓" };
+                let first = output.lines().next().unwrap_or("(空)");
+                out.push(format!("[{mark} {name}] {first}"));
+            }
+            TranscriptEntry::Thinking(_) | TranscriptEntry::SystemInfo(_) => {}
+        }
+    }
+    out.join("\n\n")
 }
 
 /// 跨平台将文本写入系统剪贴板（Windows 使用 `clip`，macOS 使用 `pbcopy`，Linux 使用 `xclip`）。
