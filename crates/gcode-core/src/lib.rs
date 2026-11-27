@@ -10,7 +10,7 @@ pub use compaction::CompactionReport;
 pub use event_store::EventStore;
 pub use governance::{
     ApprovalHandler, ApprovalOutcome, AutoApproveHandler, ChannelApprovalHandler,
-    PermissionDecision, PermissionPolicy,
+    PermissionDecision, PermissionMode, PermissionPolicy,
 };
 pub use hooks::{HookRule, HookRunner, HooksConfig, PreHookDecision};
 pub use loop_engine::{AgentRuntime, RollbackReport, build_default_system_prompt};

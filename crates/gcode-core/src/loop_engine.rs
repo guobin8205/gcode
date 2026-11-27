@@ -67,13 +67,14 @@ impl AgentRuntime {
     ) -> Self {
         let workspace_root = workspace_root.into();
         let hooks = HookRunner::load_from_workspace(&workspace_root);
+        let policy = PermissionPolicy::load_for_workspace(&workspace_root);
         Self {
             workspace_root,
             provider,
             profile,
             tools,
             store,
-            policy: PermissionPolicy::default(),
+            policy,
             hooks,
             approval,
             system_prompt: system_prompt.into(),

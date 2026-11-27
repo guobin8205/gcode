@@ -8,7 +8,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
-use gcode_core::{AgentRuntime, ApprovalOutcome, ChannelApprovalHandler};
+use gcode_core::{AgentRuntime, ApprovalOutcome, ChannelApprovalHandler, PermissionMode};
 use gcode_protocol::{EventKind, ServerNotification, SessionEvent, TokenUsage};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -54,6 +54,7 @@ struct TuiState {
     auto_scroll: bool,
     last_usage: TokenUsage,
     pending_approval: Option<PendingApproval>,
+    permission_mode: PermissionMode,
     turn_counter: u64,
 }
 
@@ -62,7 +63,12 @@ impl TuiState {
         self.pending_tasks > 0
     }
 
-    fn from_store(store: &gcode_core::EventStore, model_id: String, workspace: String) -> Self {
+    fn from_store(
+        store: &gcode_core::EventStore,
+        model_id: String,
+        workspace: String,
+        permission_mode: PermissionMode,
+    ) -> Self {
         let turn_counter = store.last_turn_id();
         let active = store.active_events();
         let (entries, last_usage) = build_entries_from_events(&active, turn_counter > 0);
@@ -78,6 +84,7 @@ impl TuiState {
             auto_scroll: true,
             last_usage,
             pending_approval: None,
+            permission_mode,
             turn_counter,
         }
     }
@@ -189,6 +196,7 @@ enum WorkerTask {
         target_turn_id: u64,
     },
     ListTurns,
+    SetMode(PermissionMode),
 }
 
 /// 启动完整的 Ratatui 交互式终端界面，并与 `AgentRuntime` 异步联动。
@@ -200,7 +208,8 @@ pub async fn run_tui_with_runtime(
 ) -> Result<()> {
     let model_id = runtime.profile.model_id.clone();
     let workspace = runtime.workspace_root.display().to_string();
-    let mut state = TuiState::from_store(&runtime.store, model_id, workspace);
+    let initial_mode = runtime.policy.mode();
+    let mut state = TuiState::from_store(&runtime.store, model_id, workspace, initial_mode);
 
     let (task_tx, mut task_rx) = mpsc::unbounded_channel::<WorkerTask>();
     let runtime_notif_tx = notif_tx.clone();
@@ -345,6 +354,9 @@ pub async fn run_tui_with_runtime(
                             kind: EventKind::TurnFinished { aborted: false },
                         },
                     });
+                }
+                WorkerTask::SetMode(mode) => {
+                    runtime.policy.set_mode(mode);
                 }
             }
         }
@@ -511,6 +523,16 @@ pub async fn run_tui_with_runtime(
                 KeyCode::Tab => {
                     state.show_thinking = !state.show_thinking;
                 }
+                KeyCode::BackTab => {
+                    let next = state.permission_mode.cycle();
+                    state.permission_mode = next;
+                    let _ = task_tx.send(WorkerTask::SetMode(next));
+                    state.entries.push(TranscriptEntry::SystemInfo(format!(
+                        "已切换权限模式 → {}（auto=编辑免问 / yolo=全自动 / ask=严格询问）",
+                        next.label()
+                    )));
+                    state.auto_scroll = true;
+                }
                 KeyCode::Up
                     if key.modifiers.contains(KeyModifiers::SHIFT)
                         || key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -597,10 +619,12 @@ pub async fn run_tui_with_runtime(
                                 "  /undo            撤销最近一轮对话并还原 Git 磁盘快照",
                                 "  /turns           查看所有活跃历史轮次与快照状态",
                                 "  /fork <轮次号>   回滚至指定轮次执行前（别名 /rollback）",
+                                "  /yolo            切换为全自动免确认模式（等同 /mode yolo）",
+                                "  /mode <模式>     切换权限模式：auto（默认编辑免问）| yolo | ask",
                                 "  /thinking        切换思考过程展开/折叠（等同 Tab）",
                                 "  /clear           清空当前屏幕显示（不影响会话历史）",
                                 "  /quit            退出 gcode",
-                                "快捷键：运行中直接输入回车可打断并切入新指令 | ↑/↓ 翻阅历史 | 滚轮/PgUp/PgDn/Shift+↑↓ 滚动 | Esc 中断",
+                                "快捷键：Shift+Tab 切换权限模式 | 运行中直接回车打断 | ↑/↓ 历史 | 滚轮/PgUp/PgDn 滚动 | Esc 中断",
                             ] {
                                 state.entries.push(TranscriptEntry::SystemInfo(l.to_string()));
                             }
@@ -614,6 +638,32 @@ pub async fn run_tui_with_runtime(
                         }
                         "/thinking" => {
                             state.show_thinking = !state.show_thinking;
+                            continue;
+                        }
+                        "/yolo" => {
+                            state.permission_mode = PermissionMode::Yolo;
+                            let _ = task_tx.send(WorkerTask::SetMode(PermissionMode::Yolo));
+                            state.entries.push(TranscriptEntry::SystemInfo(
+                                "已切换权限模式 → yolo（所有工具自动放行，按 Shift+Tab 可切回）".to_string(),
+                            ));
+                            state.auto_scroll = true;
+                            continue;
+                        }
+                        cmd if cmd.starts_with("/mode ") => {
+                            let arg = cmd.split_whitespace().nth(1).unwrap_or("");
+                            if let Some(m) = PermissionMode::parse(arg) {
+                                state.permission_mode = m;
+                                let _ = task_tx.send(WorkerTask::SetMode(m));
+                                state.entries.push(TranscriptEntry::SystemInfo(format!(
+                                    "已切换权限模式 → {}",
+                                    m.label()
+                                )));
+                            } else {
+                                state.entries.push(TranscriptEntry::SystemInfo(
+                                    "用法: /mode auto | yolo | ask".to_string(),
+                                ));
+                            }
+                            state.auto_scroll = true;
                             continue;
                         }
                         _ => {}
@@ -726,8 +776,9 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         "空闲"
     };
     let header_text = format!(
-        " 模型: {} | 状态: {} | 缓存命中: {}% ({}/{}) | 工作区: {}",
+        " 模型: {} | 权限: {} (Shift+Tab) | 状态: {} | 缓存: {}% ({}/{}) | 工作区: {}",
         state.model_id,
+        state.permission_mode.label(),
         status,
         cache_pct,
         state.last_usage.cache_hit_tokens,
@@ -829,7 +880,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
             Span::styled(" [Y / Enter] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::raw("允许本次   "),
             Span::styled("[A] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(format!("本会话始终允许 `{}`   ", approval.tool_name)),
+            Span::raw(format!("记住并始终允许 `{}`   ", approval.tool_name)),
             Span::styled("[N / Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::raw("拒绝"),
         ]));

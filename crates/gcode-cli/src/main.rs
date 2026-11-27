@@ -6,7 +6,7 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use gcode_core::{
     AgentRuntime, ApprovalHandler, AutoApproveHandler, ChannelApprovalHandler, EventStore,
-    build_default_system_prompt,
+    PermissionMode, build_default_system_prompt,
 };
 use gcode_models::{
     ApiProtocol, ModelProfile, ProviderConfig, build_provider, infer_model_family,
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
     let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
 
     let (approval, broker): (Arc<dyn ApprovalHandler>, Option<Arc<ChannelApprovalHandler>>) =
-        if cli.yolo || cli.prompt.is_some() {
+        if cli.prompt.is_some() {
             (Arc::new(AutoApproveHandler), None)
         } else {
             let b = ChannelApprovalHandler::new(notif_tx.clone());
@@ -156,6 +156,9 @@ async fn main() -> Result<()> {
         approval,
         system_prompt,
     );
+    if cli.yolo {
+        runtime.policy.set_mode(PermissionMode::Yolo);
+    }
     runtime.enable_subagent_tool();
 
     if let Some(prompt) = cli.prompt {
