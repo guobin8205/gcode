@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use gcode_core::{AgentRuntime, ApprovalOutcome, ChannelApprovalHandler, PermissionMode};
-use gcode_protocol::{EventKind, ServerNotification, SessionEvent, TokenUsage};
+use gcode_protocol::{EventKind, ServerNotification, SessionEvent, TokenUsage, ToolCall};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -29,6 +30,8 @@ enum TranscriptEntry {
     Assistant(String),
     ToolResult {
         name: String,
+        /// 从对应 `ToolCall` 参数中提取的可读动作描述（如 shell 命令、文件路径、搜索词）。
+        action: Option<String>,
         output: String,
         is_error: bool,
     },
@@ -50,6 +53,10 @@ struct TuiState {
     /// 当前排队或运行中的后台任务计数（支持运行中直接发新指令打断并无缝排队接续）。
     pending_tasks: usize,
     show_thinking: bool,
+    /// 是否展开全部历史工具调用明细（默认智能折叠连续大段工具轨迹，按 Ctrl+O 或 /tools 切换）。
+    show_tools: bool,
+    /// 缓存 `call_id -> 可读动作描述`，用于在 `ToolResult` 到来时展示真实命令/参数。
+    call_actions: HashMap<String, String>,
     scroll_offset: u16,
     auto_scroll: bool,
     last_usage: TokenUsage,
@@ -82,6 +89,8 @@ impl TuiState {
             input: InputState::default(),
             pending_tasks: 0,
             show_thinking: false,
+            show_tools: false,
+            call_actions: HashMap::new(),
             scroll_offset: 0,
             auto_scroll: true,
             last_usage,
@@ -136,6 +145,7 @@ fn build_entries_from_events(
         )));
     }
 
+    let mut call_actions: HashMap<String, String> = HashMap::new();
     for ev in events {
         match &ev.kind {
             EventKind::TurnStarted { user_input, .. } => {
@@ -144,9 +154,13 @@ fn build_entries_from_events(
             EventKind::AssistantMessage {
                 content,
                 reasoning_content,
+                tool_calls,
                 usage,
                 ..
             } => {
+                for tc in tool_calls {
+                    call_actions.insert(tc.id.clone(), summarize_tool_call(tc));
+                }
                 if let Some(r) = reasoning_content
                     && !r.is_empty()
                 {
@@ -158,6 +172,7 @@ fn build_entries_from_events(
                 last_usage = usage.clone();
             }
             EventKind::ToolResult {
+                call_id,
                 tool_name,
                 output,
                 is_error,
@@ -165,6 +180,7 @@ fn build_entries_from_events(
             } => {
                 entries.push(TranscriptEntry::ToolResult {
                     name: tool_name.clone(),
+                    action: call_actions.remove(call_id),
                     output: output.clone(),
                     is_error: *is_error,
                 });
@@ -409,17 +425,25 @@ pub async fn run_tui_with_runtime(
                     state.rebuild_from_events(&events);
                 }
                 ServerNotification::EventAppended { event } => match event.kind {
-                    EventKind::AssistantMessage { usage, .. } => {
+                    EventKind::AssistantMessage {
+                        usage, tool_calls, ..
+                    } => {
+                        for tc in tool_calls {
+                            state.call_actions.insert(tc.id.clone(), summarize_tool_call(&tc));
+                        }
                         state.last_usage = usage;
                     }
                     EventKind::ToolResult {
+                        call_id,
                         tool_name,
                         output,
                         is_error,
                         ..
                     } => {
+                        let action = state.call_actions.remove(&call_id);
                         state.entries.push(TranscriptEntry::ToolResult {
                             name: tool_name,
+                            action,
                             output,
                             is_error,
                         });
@@ -621,6 +645,9 @@ pub async fn run_tui_with_runtime(
                 KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.input.clear_to_end();
                 }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.show_tools = !state.show_tools;
+                }
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.input.history_prev();
                 }
@@ -655,6 +682,7 @@ pub async fn run_tui_with_runtime(
                                 "  /mode <模式>     切换权限模式：auto（默认编辑免问）| yolo | ask",
                                 "  /copy [all]      复制最后一条助手回复（加 all 复制全部对话记录）到剪贴板",
                                 "  /mouse           开关鼠标滚轮捕获（等同 F2；开启时按住 Shift+左键可复制）",
+                                "  /tools           展开/折叠工具调用执行明细（等同 Ctrl+O）",
                                 "  /thinking        切换思考过程展开/折叠（等同 Tab）",
                                 "  /clear           清空当前屏幕显示（不影响会话历史）",
                                 "  /quit            退出 gcode",
@@ -672,6 +700,10 @@ pub async fn run_tui_with_runtime(
                         }
                         "/thinking" => {
                             state.show_thinking = !state.show_thinking;
+                            continue;
+                        }
+                        "/tools" => {
+                            state.show_tools = !state.show_tools;
                             continue;
                         }
                         "/copy" | "/copy all" => {
@@ -874,60 +906,61 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     frame.render_widget(header, chunks[0]);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    for entry in &state.entries {
-        match entry {
+    let entries_len = state.entries.len();
+    let mut i = 0;
+    while i < entries_len {
+        match &state.entries[i] {
             TranscriptEntry::User(text) => {
+                if !lines.is_empty() {
+                    lines.push(Line::raw(""));
+                }
                 lines.push(Line::from(Span::styled(
                     format!("> {text}"),
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::raw(""));
-            }
-            TranscriptEntry::Thinking(text) => {
-                if state.show_thinking {
-                    lines.push(Line::from(Span::styled(
-                        "[思考过程 (Tab 折叠)]",
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                    )));
-                    for l in text.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {l}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                } else {
-                    let chars = text.chars().count();
-                    lines.push(Line::from(Span::styled(
-                        format!("[思考过程已折叠 ({chars} 字) — 按 Tab 展开]"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
+                i += 1;
             }
             TranscriptEntry::Assistant(text) => {
-                lines.extend(render_markdown_lines(text));
+                let mut md_lines = render_markdown_lines(text);
+                if let Some(first) = md_lines.first_mut() {
+                    first.spans.insert(
+                        0,
+                        Span::styled("● ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    );
+                }
+                lines.extend(md_lines);
                 lines.push(Line::raw(""));
-            }
-            TranscriptEntry::ToolResult {
-                name,
-                output,
-                is_error,
-            } => {
-                let (badge, color) = if *is_error {
-                    (format!("[✗ {name}]"), Color::Red)
-                } else {
-                    (format!("[✓ {name}]"), Color::Green)
-                };
-                let first_line = output.lines().next().unwrap_or("(空)");
-                lines.push(Line::from(vec![
-                    Span::styled(badge, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                    Span::raw(format!(" {first_line}")),
-                ]));
+                i += 1;
             }
             TranscriptEntry::SystemInfo(info) => {
                 lines.push(Line::from(Span::styled(
                     info.clone(),
                     Style::default().fg(Color::Blue),
                 )));
+                i += 1;
+            }
+            TranscriptEntry::Thinking(_) | TranscriptEntry::ToolResult { .. } => {
+                // 收集一段连续的执行轨迹（Thinking + ToolResult）做统一视觉分组与智能折叠
+                let start = i;
+                while i < entries_len
+                    && matches!(
+                        state.entries[i],
+                        TranscriptEntry::Thinking(_) | TranscriptEntry::ToolResult { .. }
+                    )
+                {
+                    i += 1;
+                }
+                let group = &state.entries[start..i];
+                let is_tail_group = i == entries_len && state.is_running();
+                render_execution_group(
+                    group,
+                    state.show_thinking,
+                    state.show_tools,
+                    is_tail_group,
+                    &mut lines,
+                );
+                lines.push(Line::raw(""));
             }
         }
     }
@@ -994,6 +1027,234 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     }
 }
 
+/// 将 `ToolCall` 参数格式化为简洁可读的单行动作摘要（如 shell 命令、文件路径、搜索词）。
+fn summarize_tool_call(tc: &ToolCall) -> String {
+    match tc.name.as_str() {
+        "shell" => tc
+            .arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| {
+                let one_line = c.lines().next().unwrap_or(c).trim();
+                truncate_chars(one_line, 72)
+            })
+            .unwrap_or_default(),
+        "read_file" => {
+            let path = tc.arguments.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            match (
+                tc.arguments.get("start_line").and_then(|v| v.as_u64()),
+                tc.arguments.get("limit").and_then(|v| v.as_u64()),
+            ) {
+                (Some(s), Some(l)) => format!("{path}:{s}-{}", s + l.saturating_sub(1)),
+                (Some(s), None) => format!("{path}:{s}+"),
+                _ => path.to_string(),
+            }
+        }
+        "edit_file" | "write_file" => tc
+            .arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string(),
+        "grep" => {
+            let pat = tc.arguments.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            format!("\"{}\"", truncate_chars(pat, 48))
+        }
+        "glob" => tc
+            .arguments
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("*")
+            .to_string(),
+        "spawn_agent" => tc
+            .arguments
+            .get("task")
+            .and_then(|v| v.as_str())
+            .map(|t| truncate_chars(t, 60))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+/// 渲染一段连续的思考与工具执行轨迹：
+/// - 默认智能折叠（> 3 条工具调用时收拢为清爽的一行统计摘要，运行中仅实时展示最新 3 条）；
+/// - 按 `Ctrl+O` 展开全部工具明细，按 `Tab` 展开思考过程。
+fn render_execution_group(
+    group: &[TranscriptEntry],
+    show_thinking: bool,
+    show_tools: bool,
+    is_tail_running: bool,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let mut tool_items: Vec<(&str, Option<&str>, &str, bool)> = Vec::new();
+    let mut total_thinking_chars = 0usize;
+
+    for entry in group {
+        match entry {
+            TranscriptEntry::Thinking(t) => total_thinking_chars += t.chars().count(),
+            TranscriptEntry::ToolResult {
+                name,
+                action,
+                output,
+                is_error,
+            } => tool_items.push((name.as_str(), action.as_deref(), output.as_str(), *is_error)),
+            _ => {}
+        }
+    }
+
+    // 情况 1：用户展开了思考或工具明细，或者工具数量 <= 3，直接按树形缩进清晰展示
+    if show_thinking || show_tools || tool_items.len() <= 3 {
+        if !show_thinking && total_thinking_chars > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  💭 思考过程已折叠 ({total_thinking_chars} 字) — Tab 展开"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for entry in group {
+            match entry {
+                TranscriptEntry::Thinking(text) if show_thinking => {
+                    lines.push(Line::from(Span::styled(
+                        "  💭 思考过程 (Tab 折叠):",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                    for l in text.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  │ {l}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+                TranscriptEntry::ToolResult {
+                    name,
+                    action,
+                    output,
+                    is_error,
+                } => {
+                    render_single_tool_line(name, action.as_deref(), output, *is_error, lines);
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
+    // 情况 2：工具调用超过 3 条且处于折叠态
+    let (collapsed_slice, visible_tail) = if is_tail_running {
+        let split = tool_items.len().saturating_sub(3);
+        (&tool_items[..split], &tool_items[split..])
+    } else {
+        (&tool_items[..], &tool_items[tool_items.len()..])
+    };
+
+    if !collapsed_slice.is_empty() {
+        let summary = format_tool_group_summary(collapsed_slice, total_thinking_chars);
+        lines.push(Line::from(Span::styled(
+            format!("  ▸ {summary} — Ctrl+O 展开详情"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    for &(name, action, output, is_error) in visible_tail {
+        render_single_tool_line(name, action, output, is_error, lines);
+    }
+}
+
+fn format_tool_group_summary(
+    items: &[(&str, Option<&str>, &str, bool)],
+    thinking_chars: usize,
+) -> String {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut errors = 0usize;
+    for &(name, _, _, is_err) in items {
+        *counts.entry(name).or_insert(0) += 1;
+        if is_err {
+            errors += 1;
+        }
+    }
+    let breakdown: Vec<String> = counts
+        .into_iter()
+        .map(|(k, v)| format!("{k}×{v}"))
+        .collect();
+    let err_part = if errors > 0 {
+        format!(" | {errors} 项失败")
+    } else {
+        String::new()
+    };
+    let think_part = if thinking_chars > 0 {
+        format!("，思考 {thinking_chars} 字")
+    } else {
+        String::new()
+    };
+    format!(
+        "已执行 {} 项工具（{}{err_part}）{think_part}",
+        items.len(),
+        breakdown.join(", ")
+    )
+}
+
+fn render_single_tool_line(
+    name: &str,
+    action: Option<&str>,
+    output: &str,
+    is_error: bool,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let (mark, color) = if is_error {
+        ("✗", Color::Red)
+    } else {
+        ("✓", Color::Green)
+    };
+    let detail = match (name, action) {
+        ("shell", Some(cmd)) if !cmd.is_empty() => {
+            let exit_tag = output.lines().next().unwrap_or("");
+            format!("{cmd}  {exit_tag}")
+        }
+        (_, Some(act)) if !act.is_empty() => {
+            let first = output.lines().next().unwrap_or("");
+            if name == "edit_file" || name == "write_file" {
+                truncate_chars(first, 80)
+            } else {
+                act.to_string()
+            }
+        }
+        _ => truncate_chars(output.lines().next().unwrap_or("(空)"), 80),
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{mark} {:<10} ", name),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(detail, Style::default().fg(Color::Gray)),
+    ]));
+
+    // 工具失败时，在下一行以暗红缩进展示首行真实错误内容，避免只看到 [exit_code: 1]
+    if is_error {
+        let err_snippet = output
+            .lines()
+            .skip_while(|l| l.trim().is_empty() || l.starts_with("[exit_code:"))
+            .find(|l| !l.trim().is_empty())
+            .map(|l| truncate_chars(l.trim(), 90));
+        if let Some(snippet) = err_snippet {
+            lines.push(Line::from(vec![
+                Span::styled("  │   ↳ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(snippet, Style::default().fg(Color::Red)),
+            ]));
+        }
+    }
+}
+
 /// 将当前界面对话与工具轨迹导出为纯文本，供 `/copy all` 一键复制。
 fn render_plain_transcript(entries: &[TranscriptEntry]) -> String {
     let mut out = Vec::new();
@@ -1003,12 +1264,16 @@ fn render_plain_transcript(entries: &[TranscriptEntry]) -> String {
             TranscriptEntry::Assistant(s) => out.push(s.clone()),
             TranscriptEntry::ToolResult {
                 name,
+                action,
                 output,
                 is_error,
             } => {
                 let mark = if *is_error { "✗" } else { "✓" };
-                let first = output.lines().next().unwrap_or("(空)");
-                out.push(format!("[{mark} {name}] {first}"));
+                let detail = action
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| output.lines().next().unwrap_or("(空)"));
+                out.push(format!("[{mark} {name}] {detail}"));
             }
             TranscriptEntry::Thinking(_) | TranscriptEntry::SystemInfo(_) => {}
         }
