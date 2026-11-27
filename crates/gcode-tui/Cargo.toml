@@ -1,0 +1,16 @@
+[package]
+name = "gcode-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+crossterm = "0.28"
+gcode-core.workspace = true
+gcode-models.workspace = true
+gcode-protocol.workspace = true
+ratatui = "0.29"
+tokio.workspace = true
+tokio-util.workspace = true

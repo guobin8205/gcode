@@ -1,0 +1,17 @@
+[package]
+name = "gcode-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+gcode-core.workspace = true
+gcode-models.workspace = true
+gcode-protocol.workspace = true
+gcode-tools.workspace = true
+gcode-tui.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

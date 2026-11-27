@@ -1,0 +1,861 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
+use crossterm::execute;
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use gcode_core::{AgentRuntime, ApprovalOutcome, ChannelApprovalHandler};
+use gcode_protocol::{EventKind, ServerNotification, SessionEvent, TokenUsage};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::input::InputState;
+use crate::markdown::{render_diff_lines, render_markdown_lines};
+
+#[derive(Debug, Clone)]
+enum TranscriptEntry {
+    User(String),
+    Thinking(String),
+    Assistant(String),
+    ToolResult {
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+    SystemInfo(String),
+}
+
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    call_id: String,
+    tool_name: String,
+    summary: String,
+}
+
+struct TuiState {
+    model_id: String,
+    workspace: String,
+    entries: Vec<TranscriptEntry>,
+    input: InputState,
+    /// 当前排队或运行中的后台任务计数（支持运行中直接发新指令打断并无缝排队接续）。
+    pending_tasks: usize,
+    show_thinking: bool,
+    scroll_offset: u16,
+    auto_scroll: bool,
+    last_usage: TokenUsage,
+    pending_approval: Option<PendingApproval>,
+    turn_counter: u64,
+}
+
+impl TuiState {
+    fn is_running(&self) -> bool {
+        self.pending_tasks > 0
+    }
+
+    fn from_store(store: &gcode_core::EventStore, model_id: String, workspace: String) -> Self {
+        let turn_counter = store.last_turn_id();
+        let active = store.active_events();
+        let (entries, last_usage) = build_entries_from_events(&active, turn_counter > 0);
+
+        Self {
+            model_id,
+            workspace,
+            entries,
+            input: InputState::default(),
+            pending_tasks: 0,
+            show_thinking: false,
+            scroll_offset: 0,
+            auto_scroll: true,
+            last_usage,
+            pending_approval: None,
+            turn_counter,
+        }
+    }
+
+    fn rebuild_from_events(&mut self, events: &[SessionEvent]) {
+        let (entries, last_usage) = build_entries_from_events(events, false);
+        self.entries = entries;
+        self.last_usage = last_usage;
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+    }
+
+    fn append_thinking_delta(&mut self, delta: &str) {
+        if let Some(TranscriptEntry::Thinking(buf)) = self.entries.last_mut() {
+            buf.push_str(delta);
+        } else {
+            self.entries.push(TranscriptEntry::Thinking(delta.to_string()));
+        }
+    }
+
+    fn append_text_delta(&mut self, delta: &str) {
+        if let Some(TranscriptEntry::Assistant(buf)) = self.entries.last_mut() {
+            buf.push_str(delta);
+        } else {
+            self.entries.push(TranscriptEntry::Assistant(delta.to_string()));
+        }
+    }
+}
+
+fn build_entries_from_events(
+    events: &[SessionEvent],
+    show_resume_banner: bool,
+) -> (Vec<TranscriptEntry>, TokenUsage) {
+    let mut entries = vec![TranscriptEntry::SystemInfo(
+        "欢迎使用 gcode！回车发送；Tab 折叠思考；Esc 中断；输入 /help 查看全部命令与快捷键。".to_string(),
+    )];
+    let mut last_usage = TokenUsage::default();
+    let active_turns = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::TurnStarted { .. }))
+        .count();
+
+    if show_resume_banner && active_turns > 0 {
+        entries.push(TranscriptEntry::SystemInfo(format!(
+            "已恢复历史会话（当前活跃 {active_turns} 个轮次）："
+        )));
+    }
+
+    for ev in events {
+        match &ev.kind {
+            EventKind::TurnStarted { user_input, .. } => {
+                entries.push(TranscriptEntry::User(user_input.clone()));
+            }
+            EventKind::AssistantMessage {
+                content,
+                reasoning_content,
+                usage,
+                ..
+            } => {
+                if let Some(r) = reasoning_content
+                    && !r.is_empty()
+                {
+                    entries.push(TranscriptEntry::Thinking(r.clone()));
+                }
+                if !content.is_empty() {
+                    entries.push(TranscriptEntry::Assistant(content.clone()));
+                }
+                last_usage = usage.clone();
+            }
+            EventKind::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } => {
+                entries.push(TranscriptEntry::ToolResult {
+                    name: tool_name.clone(),
+                    output: output.clone(),
+                    is_error: *is_error,
+                });
+            }
+            EventKind::TurnFinished { aborted: true } => {
+                entries.push(TranscriptEntry::SystemInfo("（该轮次曾被中断）".to_string()));
+            }
+            EventKind::CompactionPerformed { .. } => {
+                entries.push(TranscriptEntry::SystemInfo(
+                    "── [已执行上下文压缩与长期记忆落盘] ──".to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    (entries, last_usage)
+}
+
+enum WorkerTask {
+    Prompt {
+        turn_id: u64,
+        prompt: String,
+        cancel: CancellationToken,
+    },
+    Compact {
+        turn_id: u64,
+        cancel: CancellationToken,
+    },
+    Undo,
+    Fork {
+        target_turn_id: u64,
+    },
+    ListTurns,
+}
+
+/// 启动完整的 Ratatui 交互式终端界面，并与 `AgentRuntime` 异步联动。
+pub async fn run_tui_with_runtime(
+    mut runtime: AgentRuntime,
+    approval_broker: Option<Arc<ChannelApprovalHandler>>,
+    notif_tx: mpsc::UnboundedSender<ServerNotification>,
+    mut notif_rx: mpsc::UnboundedReceiver<ServerNotification>,
+) -> Result<()> {
+    let model_id = runtime.profile.model_id.clone();
+    let workspace = runtime.workspace_root.display().to_string();
+    let mut state = TuiState::from_store(&runtime.store, model_id, workspace);
+
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<WorkerTask>();
+    let runtime_notif_tx = notif_tx.clone();
+    tokio::spawn(async move {
+        while let Some(task) = task_rx.recv().await {
+            match task {
+                WorkerTask::Prompt {
+                    turn_id,
+                    prompt,
+                    cancel,
+                } => {
+                    if let Err(e) = runtime.run_turn(turn_id, prompt, cancel, &runtime_notif_tx).await {
+                        let _ = runtime_notif_tx.send(ServerNotification::EventAppended {
+                            event: gcode_protocol::SessionEvent {
+                                seq: 0,
+                                timestamp: chrono::Utc::now(),
+                                turn_id,
+                                step_id: None,
+                                ignorable: true,
+                                kind: EventKind::Error {
+                                    message: e.to_string(),
+                                },
+                            },
+                        });
+                        let _ = runtime_notif_tx.send(ServerNotification::EventAppended {
+                            event: gcode_protocol::SessionEvent {
+                                seq: 0,
+                                timestamp: chrono::Utc::now(),
+                                turn_id,
+                                step_id: None,
+                                ignorable: true,
+                                kind: EventKind::TurnFinished { aborted: true },
+                            },
+                        });
+                    }
+                }
+                WorkerTask::Compact { turn_id, cancel } => {
+                    let _ = runtime_notif_tx.send(ServerNotification::StatusMessage {
+                        message: "正在执行静默记忆落盘与上下文压缩…".to_string(),
+                    });
+                    match runtime.compact(turn_id, 1, cancel, &runtime_notif_tx).await {
+                        Ok(report) => {
+                            let _ = runtime_notif_tx.send(ServerNotification::StatusMessage {
+                                message: report.reason,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = runtime_notif_tx.send(ServerNotification::EventAppended {
+                                event: gcode_protocol::SessionEvent {
+                                    seq: 0,
+                                    timestamp: chrono::Utc::now(),
+                                    turn_id,
+                                    step_id: None,
+                                    ignorable: true,
+                                    kind: EventKind::Error {
+                                        message: format!("压缩失败: {e}"),
+                                    },
+                                },
+                            });
+                        }
+                    }
+                    let _ = runtime_notif_tx.send(ServerNotification::EventAppended {
+                        event: gcode_protocol::SessionEvent {
+                            seq: 0,
+                            timestamp: chrono::Utc::now(),
+                            turn_id,
+                            step_id: None,
+                            ignorable: true,
+                            kind: EventKind::TurnFinished { aborted: false },
+                        },
+                    });
+                }
+                WorkerTask::Undo => {
+                    match runtime.undo_last_turn(&runtime_notif_tx) {
+                        Ok(report) => {
+                            let _ = runtime_notif_tx.send(ServerNotification::StatusMessage {
+                                message: report.message,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = runtime_notif_tx.send(ServerNotification::StatusMessage {
+                                message: format!("撤销失败: {e}"),
+                            });
+                        }
+                    }
+                    let _ = runtime_notif_tx.send(ServerNotification::EventAppended {
+                        event: gcode_protocol::SessionEvent {
+                            seq: 0,
+                            timestamp: chrono::Utc::now(),
+                            turn_id: 0,
+                            step_id: None,
+                            ignorable: true,
+                            kind: EventKind::TurnFinished { aborted: false },
+                        },
+                    });
+                }
+                WorkerTask::Fork { target_turn_id } => {
+                    match runtime.rollback_to_turn(target_turn_id, &runtime_notif_tx) {
+                        Ok(report) => {
+                            let _ = runtime_notif_tx.send(ServerNotification::StatusMessage {
+                                message: report.message,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = runtime_notif_tx.send(ServerNotification::StatusMessage {
+                                message: format!("回滚失败: {e}"),
+                            });
+                        }
+                    }
+                    let _ = runtime_notif_tx.send(ServerNotification::EventAppended {
+                        event: gcode_protocol::SessionEvent {
+                            seq: 0,
+                            timestamp: chrono::Utc::now(),
+                            turn_id: 0,
+                            step_id: None,
+                            ignorable: true,
+                            kind: EventKind::TurnFinished { aborted: false },
+                        },
+                    });
+                }
+                WorkerTask::ListTurns => {
+                    let turns = runtime.store.active_turns();
+                    let msg = if turns.is_empty() {
+                        "当前没有活跃的历史轮次。".to_string()
+                    } else {
+                        let mut lines = vec!["当前活跃轮次（可用 `/fork <轮次号>` 回滚至该轮之前）：".to_string()];
+                        for (tid, input, has_snap) in turns {
+                            let snap_tag = if has_snap { "[含快照]" } else { "[无快照]" };
+                            let preview: String = input.chars().take(48).collect();
+                            lines.push(format!("  #{tid} {snap_tag} {preview}"));
+                        }
+                        lines.join("\n")
+                    };
+                    let _ = runtime_notif_tx.send(ServerNotification::StatusMessage { message: msg });
+                    let _ = runtime_notif_tx.send(ServerNotification::EventAppended {
+                        event: gcode_protocol::SessionEvent {
+                            seq: 0,
+                            timestamp: chrono::Utc::now(),
+                            turn_id: 0,
+                            step_id: None,
+                            ignorable: true,
+                            kind: EventKind::TurnFinished { aborted: false },
+                        },
+                    });
+                }
+            }
+        }
+    });
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut active_cancel: Option<CancellationToken> = None;
+
+    let res = loop {
+        while let Ok(notif) = notif_rx.try_recv() {
+            match notif {
+                ServerNotification::StreamDelta {
+                    text_delta,
+                    reasoning_delta,
+                    ..
+                } => {
+                    if let Some(r) = reasoning_delta {
+                        state.append_thinking_delta(&r);
+                    }
+                    if let Some(t) = text_delta {
+                        state.append_text_delta(&t);
+                    }
+                    state.auto_scroll = true;
+                }
+                ServerNotification::ApprovalRequired {
+                    call_id,
+                    tool_name,
+                    summary,
+                } => {
+                    state.pending_approval = Some(PendingApproval {
+                        call_id,
+                        tool_name,
+                        summary,
+                    });
+                }
+                ServerNotification::StatusMessage { message } => {
+                    for line in message.lines() {
+                        state.entries.push(TranscriptEntry::SystemInfo(line.to_string()));
+                    }
+                    state.auto_scroll = true;
+                }
+                ServerNotification::SessionRebuilt { events } => {
+                    state.rebuild_from_events(&events);
+                }
+                ServerNotification::EventAppended { event } => match event.kind {
+                    EventKind::AssistantMessage { usage, .. } => {
+                        state.last_usage = usage;
+                    }
+                    EventKind::ToolResult {
+                        tool_name,
+                        output,
+                        is_error,
+                        ..
+                    } => {
+                        state.entries.push(TranscriptEntry::ToolResult {
+                            name: tool_name,
+                            output,
+                            is_error,
+                        });
+                        state.auto_scroll = true;
+                    }
+                    EventKind::TurnFinished { aborted } => {
+                        state.pending_tasks = state.pending_tasks.saturating_sub(1);
+                        if state.pending_tasks == 0 {
+                            active_cancel = None;
+                        }
+                        if aborted {
+                            state.entries.push(TranscriptEntry::SystemInfo("（上一轮执行已中断）".to_string()));
+                        }
+                        state.auto_scroll = true;
+                    }
+                    EventKind::Error { message } => {
+                        state.entries.push(TranscriptEntry::SystemInfo(format!("错误: {message}")));
+                        state.auto_scroll = true;
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        if let Err(e) = terminal.draw(|frame| draw_ui(frame, &mut state)) {
+            break Err(e.into());
+        }
+
+        if event::poll(Duration::from_millis(20))? {
+            let ev = event::read()?;
+            if let Event::Mouse(mouse) = ev {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        state.auto_scroll = false;
+                        state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        state.scroll_offset = state.scroll_offset.saturating_add(3);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if let Event::Key(key) = ev
+                && key.kind == KeyEventKind::Press
+            {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                if let Some(c) = active_cancel.take() {
+                    c.cancel();
+                }
+                break Ok(());
+            }
+
+            if let Some(approval) = state.pending_approval.clone() {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        if let Some(broker) = &approval_broker {
+                            broker.resolve(&approval.call_id, ApprovalOutcome::AllowOnce);
+                        }
+                        state.pending_approval = None;
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        if let Some(broker) = &approval_broker {
+                            broker.resolve(&approval.call_id, ApprovalOutcome::AllowSession);
+                        }
+                        state.pending_approval = None;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        if let Some(broker) = &approval_broker {
+                            broker.resolve(&approval.call_id, ApprovalOutcome::Deny);
+                        }
+                        state.pending_approval = None;
+                    }
+                    KeyCode::Up => {
+                        state.auto_scroll = false;
+                        state.scroll_offset = state.scroll_offset.saturating_sub(2);
+                    }
+                    KeyCode::Down => {
+                        state.scroll_offset = state.scroll_offset.saturating_add(2);
+                    }
+                    KeyCode::PageUp => {
+                        state.auto_scroll = false;
+                        state.scroll_offset = state.scroll_offset.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        state.scroll_offset = state.scroll_offset.saturating_add(10);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(c) = active_cancel.take() {
+                        c.cancel();
+                        state.entries.push(TranscriptEntry::SystemInfo(
+                            "正在中断当前执行…".to_string(),
+                        ));
+                        state.auto_scroll = true;
+                    }
+                }
+                KeyCode::Tab => {
+                    state.show_thinking = !state.show_thinking;
+                }
+                KeyCode::Up
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    state.auto_scroll = false;
+                    state.scroll_offset = state.scroll_offset.saturating_sub(2);
+                }
+                KeyCode::Down
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    state.scroll_offset = state.scroll_offset.saturating_add(2);
+                }
+                KeyCode::Up => {
+                    state.input.history_prev();
+                }
+                KeyCode::Down => {
+                    state.input.history_next();
+                }
+                KeyCode::PageUp => {
+                    state.auto_scroll = false;
+                    state.scroll_offset = state.scroll_offset.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    state.scroll_offset = state.scroll_offset.saturating_add(10);
+                }
+                KeyCode::Left => {
+                    state.input.move_left();
+                }
+                KeyCode::Right => {
+                    state.input.move_right();
+                }
+                KeyCode::Home => {
+                    state.input.move_home();
+                }
+                KeyCode::End => {
+                    state.input.move_end();
+                }
+                KeyCode::Delete => {
+                    state.input.delete();
+                }
+                KeyCode::Backspace => {
+                    state.input.backspace();
+                }
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.input.move_home();
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.input.move_end();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.input.clear_to_start();
+                }
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.input.clear_to_end();
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.input.history_prev();
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.input.history_next();
+                }
+                KeyCode::Char(c) => {
+                    state.input.insert_char(c);
+                }
+                KeyCode::Enter => {
+                    if state.input.text().trim().is_empty() {
+                        continue;
+                    }
+                    let trimmed = state.input.take_and_record();
+                    if matches!(trimmed.as_str(), "/quit" | "/exit") {
+                        if let Some(c) = active_cancel.take() {
+                            c.cancel();
+                        }
+                        break Ok(());
+                    }
+
+                    // 纯本地界面命令无需打断后台任务
+                    match trimmed.as_str() {
+                        "/help" => {
+                            for l in [
+                                "可用命令：",
+                                "  /compact         执行静默记忆落盘与上下文压缩",
+                                "  /undo            撤销最近一轮对话并还原 Git 磁盘快照",
+                                "  /turns           查看所有活跃历史轮次与快照状态",
+                                "  /fork <轮次号>   回滚至指定轮次执行前（别名 /rollback）",
+                                "  /thinking        切换思考过程展开/折叠（等同 Tab）",
+                                "  /clear           清空当前屏幕显示（不影响会话历史）",
+                                "  /quit            退出 gcode",
+                                "快捷键：运行中直接输入回车可打断并切入新指令 | ↑/↓ 翻阅历史 | 滚轮/PgUp/PgDn/Shift+↑↓ 滚动 | Esc 中断",
+                            ] {
+                                state.entries.push(TranscriptEntry::SystemInfo(l.to_string()));
+                            }
+                            state.auto_scroll = true;
+                            continue;
+                        }
+                        "/clear" => {
+                            state.entries.clear();
+                            state.scroll_offset = 0;
+                            continue;
+                        }
+                        "/thinking" => {
+                            state.show_thinking = !state.show_thinking;
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    // 若当前有运行中的任务，直接打断它并无缝切入新指令
+                    if state.is_running() {
+                        if let Some(c) = active_cancel.take() {
+                            c.cancel();
+                        }
+                        if let Some(approval) = state.pending_approval.take()
+                            && let Some(broker) = &approval_broker
+                        {
+                            broker.resolve(&approval.call_id, ApprovalOutcome::Deny);
+                        }
+                        state.entries.push(TranscriptEntry::SystemInfo(
+                            "⚡ 已打断当前执行，切入新指令…".to_string(),
+                        ));
+                    }
+
+                    match trimmed.as_str() {
+                        "/compact" => {
+                            let cancel = CancellationToken::new();
+                            active_cancel = Some(cancel.clone());
+                            state.pending_tasks += 1;
+                            state.auto_scroll = true;
+                            let _ = task_tx.send(WorkerTask::Compact {
+                                turn_id: state.turn_counter,
+                                cancel,
+                            });
+                        }
+                        "/undo" => {
+                            state.pending_tasks += 1;
+                            state.auto_scroll = true;
+                            let _ = task_tx.send(WorkerTask::Undo);
+                        }
+                        "/turns" => {
+                            state.pending_tasks += 1;
+                            state.auto_scroll = true;
+                            let _ = task_tx.send(WorkerTask::ListTurns);
+                        }
+                        cmd if cmd.starts_with("/fork ") || cmd.starts_with("/rollback ") => {
+                            let arg = cmd.split_whitespace().nth(1).unwrap_or("");
+                            match arg.trim_start_matches('#').parse::<u64>() {
+                                Ok(target_turn_id) => {
+                                    state.pending_tasks += 1;
+                                    state.auto_scroll = true;
+                                    let _ = task_tx.send(WorkerTask::Fork { target_turn_id });
+                                }
+                                Err(_) => {
+                                    state.entries.push(TranscriptEntry::SystemInfo(
+                                        "用法: /fork <轮次号>（先输入 /turns 查看可用轮次）".to_string(),
+                                    ));
+                                    state.auto_scroll = true;
+                                }
+                            }
+                        }
+                        _ => {
+                            state.turn_counter += 1;
+                            let cancel = CancellationToken::new();
+                            active_cancel = Some(cancel.clone());
+                            state.pending_tasks += 1;
+                            state.entries.push(TranscriptEntry::User(trimmed.clone()));
+                            state.auto_scroll = true;
+                            let _ = task_tx.send(WorkerTask::Prompt {
+                                turn_id: state.turn_counter,
+                                prompt: trimmed,
+                                cancel,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            }
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    res
+}
+
+fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
+    let bottom_height = if let Some(approval) = &state.pending_approval {
+        let diff_lines = approval.summary.lines().count().min(8);
+        (diff_lines as u16 + 4).clamp(6, 12)
+    } else {
+        3
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(bottom_height),
+        ])
+        .split(frame.area());
+
+    let total_prompt = state.last_usage.prompt_tokens.max(1);
+    let cache_pct = (state.last_usage.cache_hit_tokens * 100) / total_prompt;
+    let status = if state.is_running() {
+        "运行中 (Esc 中断 / 直接输入回车打断)"
+    } else {
+        "空闲"
+    };
+    let header_text = format!(
+        " 模型: {} | 状态: {} | 缓存命中: {}% ({}/{}) | 工作区: {}",
+        state.model_id,
+        status,
+        cache_pct,
+        state.last_usage.cache_hit_tokens,
+        state.last_usage.prompt_tokens,
+        state.workspace
+    );
+    let header = Paragraph::new(header_text)
+        .block(Block::default().title(" gcode ").borders(Borders::ALL))
+        .style(Style::default().fg(Color::Cyan));
+    frame.render_widget(header, chunks[0]);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for entry in &state.entries {
+        match entry {
+            TranscriptEntry::User(text) => {
+                lines.push(Line::from(Span::styled(
+                    format!("> {text}"),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::raw(""));
+            }
+            TranscriptEntry::Thinking(text) => {
+                if state.show_thinking {
+                    lines.push(Line::from(Span::styled(
+                        "[思考过程 (Tab 折叠)]",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    )));
+                    for l in text.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {l}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                } else {
+                    let chars = text.chars().count();
+                    lines.push(Line::from(Span::styled(
+                        format!("[思考过程已折叠 ({chars} 字) — 按 Tab 展开]"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            TranscriptEntry::Assistant(text) => {
+                lines.extend(render_markdown_lines(text));
+                lines.push(Line::raw(""));
+            }
+            TranscriptEntry::ToolResult {
+                name,
+                output,
+                is_error,
+            } => {
+                let (badge, color) = if *is_error {
+                    (format!("[✗ {name}]"), Color::Red)
+                } else {
+                    (format!("[✓ {name}]"), Color::Green)
+                };
+                let first_line = output.lines().next().unwrap_or("(空)");
+                lines.push(Line::from(vec![
+                    Span::styled(badge, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" {first_line}")),
+                ]));
+            }
+            TranscriptEntry::SystemInfo(info) => {
+                lines.push(Line::from(Span::styled(
+                    info.clone(),
+                    Style::default().fg(Color::Blue),
+                )));
+            }
+        }
+    }
+
+    let view_height = chunks[1].height.saturating_sub(2);
+    let inner_width = chunks[1].width.saturating_sub(2).max(1) as usize;
+    let total_visual_lines: usize = lines
+        .iter()
+        .map(|l| l.width().max(1).div_ceil(inner_width))
+        .sum();
+    let max_scroll = (total_visual_lines.min(u16::MAX as usize) as u16).saturating_sub(view_height);
+
+    if state.auto_scroll {
+        state.scroll_offset = max_scroll;
+    } else {
+        state.scroll_offset = state.scroll_offset.min(max_scroll);
+        if state.scroll_offset == max_scroll {
+            state.auto_scroll = true;
+        }
+    }
+
+    let transcript = Paragraph::new(lines)
+        .block(Block::default().title(" 对话与执行轨迹 ").borders(Borders::ALL))
+        .wrap(Wrap { trim: false })
+        .scroll((state.scroll_offset, 0));
+    frame.render_widget(transcript, chunks[1]);
+
+    if let Some(approval) = &state.pending_approval {
+        let max_diff = bottom_height.saturating_sub(4) as usize;
+        let mut panel_lines = render_diff_lines(&approval.summary, max_diff.max(2));
+        panel_lines.push(Line::raw(""));
+        panel_lines.push(Line::from(vec![
+            Span::styled(" [Y / Enter] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("允许本次   "),
+            Span::styled("[A] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!("本会话始终允许 `{}`   ", approval.tool_name)),
+            Span::styled("[N / Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw("拒绝"),
+        ]));
+
+        let panel = Paragraph::new(panel_lines)
+            .block(
+                Block::default()
+                    .title(format!(" 权限确认: {} ", approval.tool_name))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(panel, chunks[2]);
+    } else {
+        let input = Paragraph::new(format!("> {}", state.input.text()))
+            .block(
+                Block::default()
+                    .title(" 输入指令 (Enter 发送 | ↑/↓ 历史 | 滚轮/PgUp/PgDn 滚动 | /help 帮助) ")
+                    .borders(Borders::ALL),
+            );
+        frame.render_widget(input, chunks[2]);
+
+        // 将终端硬件光标精准定位到当前编辑位置（+1 左边框，+2 "> " 前缀）
+        let max_x = chunks[2].x + chunks[2].width.saturating_sub(2);
+        let cursor_x = (chunks[2].x + 3 + state.input.cursor_visual_width()).min(max_x);
+        let cursor_y = chunks[2].y + 1;
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
